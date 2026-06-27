@@ -95,7 +95,7 @@ class GroupedGemmMoE(nnx.Module):
         )
 
     # ----------------------------------------------------------------------- #
-    def _route(self, x_flat):
+    def _route(self, x_flat: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         """x_flat: [T, d] -> (top_idx [T,k], gate [T,k], scores [T,E])."""
         logits = self.router(x_flat).astype(F32)
         scores = jax.nn.sigmoid(logits)  # affinities [T,E]
@@ -115,7 +115,7 @@ class GroupedGemmMoE(nnx.Module):
         return a @ self.ws_down.value
 
     # ----------------------------------------------------------------------- #
-    def __call__(self, x, return_aux: bool = False):
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
         B, L, d = x.shape
         T = B * L
         k = self.top_k
@@ -153,9 +153,6 @@ class GroupedGemmMoE(nnx.Module):
         out = routed + self._shared(xf).astype(F32)
         out = out.reshape(B, L, d).astype(cdtype)
 
-        if not return_aux:
-            return out
-
         # ---- diagnostics for the training loop ----
         load = group_sizes.astype(F32) / (T * k)  # fraction per expert
         # Switch/DeepSeek aux loss: E * <f_e, P_e>, P from softmax routing probs.
@@ -165,7 +162,7 @@ class GroupedGemmMoE(nnx.Module):
         return out, aux
 
     # ----------------------------------------------------------------------- #
-    def dense_forward(self, x):
+    def dense_forward(self, x: jax.Array) -> jax.Array:
         """Reference path computing every expert densely (for tests only).
         Uses the SAME weights as __call__, so any mismatch is a dispatch/GEMM bug."""
         B, L, d = x.shape

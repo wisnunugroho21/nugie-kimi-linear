@@ -45,6 +45,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+
         # How many query heads share each KV/latent head (the GQA group size).
         self.group_size = num_q_heads // num_kv_heads
 

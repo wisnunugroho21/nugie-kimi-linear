@@ -225,15 +225,17 @@ class GatedDeltaNet2(nnx.Module):
         # NOTE (deviation 2): App. D.5 specifies Xavier-uniform init, gain 2^{-2.5}, zero biases;
         # this module uses Flax NNX default initializers instead.
 
-    def _split_k(self, x, B, L):
+    def _split_k(self, x: jax.Array, B: int, L: int) -> jax.Array:
         # Head reshaping for key-side tensors (App. C.1: "followed by head reshaping").
         return x.reshape(B, L, self.H, self.dk).transpose(0, 2, 1, 3)  # [B,H,L,dk]
 
-    def _split_v(self, x, B, L):
+    def _split_v(self, x: jax.Array, B: int, L: int) -> jax.Array:
         # Head reshaping for value-side tensors.
         return x.reshape(B, L, self.Hv, self.dv).transpose(0, 2, 1, 3)  # [B,Hv,L,dv]
 
-    def __call__(self, x, initial_state=None):
+    def __call__(
+        self, x: jax.Array, initial_state: jax.Array | None = None
+    ) -> tuple[jax.Array, jax.Array]:
         """x: [B, L, d_model]. Returns (out: [B, L, d_model], final_state: [B,Hv,dk,dv])."""
         B, L, _ = x.shape
 
@@ -286,7 +288,7 @@ class GatedDeltaNet2(nnx.Module):
             initial_state = jnp.zeros((B, self.Hv, self.dk, self.dv), jnp.float32)
 
         # Gated Delta Rule-2 chunkwise core (Eq. 10); the kernel forms cumsum γ internally (Eq. 30).
-        o, final_state = chunkwise_gated_delta_rule_2(
+        o, _final_state = chunkwise_gated_delta_rule_2(
             q, k, v, g, b, w, initial_state, chunk_size=self.chunk_size
         )
 
@@ -294,4 +296,4 @@ class GatedDeltaNet2(nnx.Module):
         o = o.transpose(0, 2, 1, 3)  # [B,Hv,L,dv] -> [B,L,Hv,dv]
         o = self.o_norm(o, x)  # low-rank sigmoid gate computed inside, from x
         out = self.o_proj(o.astype(x.dtype))  # project back to d_model
-        return out, final_state
+        return out, _final_state

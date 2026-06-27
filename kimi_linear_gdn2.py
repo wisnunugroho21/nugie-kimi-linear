@@ -45,6 +45,7 @@ import dataclasses
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+from jax.typing import ArrayLike
 
 # Reuse the building blocks already implemented and verified in this repo.
 from gated_deltanet_2.layer import GatedDeltaNet2, RMSNorm
@@ -61,9 +62,9 @@ from multi_latent_attention.moe import GroupedGemmMoE
 # --------------------------------------------------------------------------- #
 @dataclasses.dataclass
 class KimiLinearConfig:
-    vocab_size: int = 256          # paper: 160k; tiny here (byte-level demo)
-    d_model: int = 256             # model width  (paper 1.3B: 2048)
-    n_layers: int = 8              # depth        (paper 1.3B: 27)
+    vocab_size: int = 256  # paper: 160k; tiny here (byte-level demo)
+    d_model: int = 256  # model width  (paper 1.3B: 2048)
+    n_layers: int = 8  # depth        (paper 1.3B: 27)
 
     # --- Hybrid schedule: which layers are FULL attention (MLA) vs linear (GDN-2) ---
     # full_attn_period = 4 places one MLA layer every 4th layer (indices 3, 7, ...),
@@ -71,29 +72,29 @@ class KimiLinearConfig:
     full_attn_period: int = 4
 
     # --- GDN-2 token mixer (the KDA replacement) — see gated_deltanet_2/layer.py ---
-    gdn_num_heads: int = 4         # H key/query heads   (paper 1.3B: 16)
-    gdn_head_k_dim: int = 64       # d_k                 (paper: 128)
-    gdn_head_v_dim: int = 64       # d_v                 (paper: 128)
+    gdn_num_heads: int = 4  # H key/query heads   (paper 1.3B: 16)
+    gdn_head_k_dim: int = 64  # d_k                 (paper: 128)
+    gdn_head_v_dim: int = 64  # d_v                 (paper: 128)
     gdn_num_v_heads: int | None = None  # H_v for GQA value heads; None -> = num_heads
-    gdn_chunk_size: int = 64       # chunkwise block size C (paper App.: 64).
+    gdn_chunk_size: int = 64  # chunkwise block size C (paper App.: 64).
     #   NOTE: the GDN-2 chunkwise core requires every fed sequence length to be a
     #   multiple of this C (it reshapes L into L/C chunks). Keep seq_len % C == 0.
-    gdn_conv_size: int = 4         # short-conv kernel width
-    gdn_expanded_erase: bool = False    # erase gate in [0,2] (neg-eigenvalue variant)
+    gdn_conv_size: int = 4  # short-conv kernel width
+    gdn_expanded_erase: bool = False  # erase gate in [0,2] (neg-eigenvalue variant)
 
     # --- MLA full-attention layers (NoPE) — see multi_latent_attention/attention.py ---
-    mla_num_q_heads: int = 8       # query heads
-    mla_num_kv_heads: int = 2      # KV/latent heads (GQA); q_heads must be a multiple
-    mla_head_dim: int = 64         # per-head latent (rank) width
-    max_seq_len: int = 512         # builds the causal mask; cap on trainable length
+    mla_num_q_heads: int = 8  # query heads
+    mla_num_kv_heads: int = 2  # KV/latent heads (GQA); q_heads must be a multiple
+    mla_head_dim: int = 64  # per-head latent (rank) width
+    max_seq_len: int = 512  # builds the causal mask; cap on trainable length
 
     # --- Channel mixer (FFN) ---
-    use_moe: bool = True           # True -> MoE (faithful); False -> dense SwiGLU MLP
-    moe_d_ff: int = 512            # per-expert hidden width (paper: 1408 at 1.3B)
-    moe_n_routed: int = 8          # number of routed experts E (paper: 256)
-    moe_n_shared: int = 1          # always-on shared experts
-    moe_top_k: int = 2             # experts activated per token (paper: 8)
-    mlp_d_ff: int = 768            # hidden width of the dense MLP fallback
+    use_moe: bool = True  # True -> MoE (faithful); False -> dense SwiGLU MLP
+    moe_d_ff: int = 512  # per-expert hidden width (paper: 1408 at 1.3B)
+    moe_n_routed: int = 8  # number of routed experts E (paper: 256)
+    moe_n_shared: int = 1  # always-on shared experts
+    moe_top_k: int = 2  # experts activated per token (paper: 8)
+    mlp_d_ff: int = 768  # hidden width of the dense MLP fallback
 
     rms_eps: float = 1e-5
 
@@ -173,15 +174,15 @@ class DecoderLayer(nnx.Module):
         else:
             self.channel_mixer = SwiGLUMLP(cfg.d_model, cfg.mlp_d_ff, rngs=rngs)
 
-    def __call__(self, x, return_aux: bool = False):
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
         """x: [B, L, d_model] -> (x, aux_or_None).
 
-        `aux` (only when return_aux and this is an MoE layer) carries the MoE
-        load-balancing diagnostics the training loop needs (aux loss + per-expert
-        token counts for the router-bias update)."""
+        `aux` carries the MoE load-balancing diagnostics the training loop
+        needs (aux loss + per-expert token counts for the router-bias update).
+        """
         # --- token mixing (residual, pre-norm) ---
         h = self.norm1(x)
-        if self.is_full_attn:
+        if isinstance(self.token_mixer, GroupedQueryLatentAttention):
             h = self.token_mixer(h)
         else:
             # GDN-2 also returns its end-of-sequence recurrent state; unused in
@@ -191,10 +192,7 @@ class DecoderLayer(nnx.Module):
 
         # --- channel mixing (residual, pre-norm) ---
         y = self.norm2(x)
-        if self.is_moe and return_aux:
-            m, aux = self.channel_mixer(y, return_aux=True)
-        else:
-            m, aux = self.channel_mixer(y), None
+        m, aux = self.channel_mixer(y)
         x = x + m
         return x, aux
 
@@ -217,9 +215,13 @@ class KimiLinear(nnx.Module):
         # Final pre-head norm + untied LM head (Moonlight/DeepSeek do not tie weights;
         # to tie, drop lm_head and use `x @ self.embed.embedding.value.T` instead).
         self.norm_f = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
-        self.lm_head = nnx.Linear(cfg.d_model, cfg.vocab_size, use_bias=False, rngs=rngs)
+        self.lm_head = nnx.Linear(
+            cfg.d_model, cfg.vocab_size, use_bias=False, rngs=rngs
+        )
 
-    def __call__(self, input_ids: jax.Array, return_aux: bool = False):
+    def __call__(
+        self, input_ids: jax.Array, return_aux: bool = False
+    ) -> tuple[jax.Array, dict[str, ArrayLike]]:
         """input_ids: int[B, L] -> logits[B, L, vocab]  (or (logits, aux) if return_aux).
 
         aux = {"aux_loss": scalar summed over MoE layers,
@@ -227,24 +229,22 @@ class KimiLinear(nnx.Module):
         """
         x = self.embed(input_ids)  # [B, L, d_model]
 
-        aux_loss = 0.0
-        group_sizes = []  # one [E] vector per MoE layer, in layer order
+        aux_loss: ArrayLike = 0.0
+        group_sizes: list[
+            ArrayLike
+        ] = []  # one [E] vector per MoE layer, in layer order
         for layer in self.layers:
-            x, aux = layer(x, return_aux=return_aux)
-            if aux is not None:
-                aux_loss = aux_loss + aux["aux_loss"]
-                group_sizes.append(aux["group_sizes"])
+            x, aux = layer(x)
+
+            aux_loss = aux_loss + aux["aux_loss"]
+            group_sizes.append(aux["group_sizes"])
 
         x = self.norm_f(x)
         logits = self.lm_head(x)  # [B, L, vocab]
 
-        if return_aux:
-            return logits, {"aux_loss": aux_loss, "group_sizes": group_sizes}
-        return logits
+        return logits, {"aux_loss": aux_loss, "group_sizes": jnp.stack(group_sizes)}
 
 
 def count_params(model: nnx.Module) -> int:
     """Total number of trainable parameters (sum of nnx.Param leaf sizes)."""
-    return int(
-        sum(x.size for x in jax.tree.leaves(nnx.state(model, nnx.Param)))
-    )
+    return int(sum(x.size for x in jax.tree.leaves(nnx.state(model, nnx.Param))))

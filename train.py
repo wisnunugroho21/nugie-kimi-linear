@@ -61,7 +61,8 @@ def cross_entropy(logits, targets):
 
 def next_token_accuracy(model, batch):
     """Token accuracy of the next-token prediction over a batch (eval only)."""
-    logits = model(batch)[:, :-1]          # predict positions 1..L-1
+    logits, _ = model(batch)
+    logits = logits[:, :-1]          # predict positions 1..L-1
     preds = jnp.argmax(logits, axis=-1)
     return jnp.mean((preds == batch[:, 1:]).astype(jnp.float32))
 
@@ -166,7 +167,7 @@ def main(
 
     # --- Orbax: save the model state, reload into a fresh model, verify equality. ---
     eval_ids = sample_batch(jax.random.PRNGKey(123), 4, seq_len, vocab_size)
-    ref_logits = model(eval_ids)  # reference output before reload
+    ref_logits, _ = model(eval_ids)  # reference output before reload
 
     ckpt_dir = tempfile.mkdtemp()
     path = f"{ckpt_dir}/kimi_linear_state"
