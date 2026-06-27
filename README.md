@@ -27,6 +27,27 @@ gate `w` (the original GDN/KDA tie them with a single `beta`).
    token mixer = GDN-2 (linear) on 3 of every 4 layers, MLA (full, NoPE) on the 4th
 ```
 
+## Two forward modes: training and streaming inference
+
+Every token mixer supports a parallel full-sequence path *and* a stateful streaming
+path, so the model can score a whole sequence at once or decode token-by-token while
+**reusing state across steps**:
+
+| | Full sequence — `model(ids)` | Streaming — `model.step` / `model.generate` |
+|---|---|---|
+| GDN-2 (linear) | chunkwise-parallel core | recurrent core, carrying a **fixed-size** state `S` + short-conv cache |
+| MLA (full attn) | full causal-attention matrix | cached KV **latent** (grows with context) |
+
+```python
+cont = model.generate(prompt_ids, max_new_tokens=32)   # greedy decode, reuses per-layer state
+```
+
+The headline property: a GDN-2 layer's entire history collapses into a fixed-size
+matrix `S` (`[B, Hv, dk, dv]`) — so decoding is **O(1) per token, independent of
+context length**. Only the 1-in-4 MLA layers keep a growing cache. `sanity_check.py`
+verifies that streaming token-by-token reproduces the full-sequence forward exactly
+(identical argmax predictions).
+
 ## Files
 
 | File | What it is |
@@ -57,8 +78,9 @@ checks the logits are bit-identical.
   q/k, sigmoid output gate.
 * **Deliberate simplifications (flagged inline):** tiny default dims; the GDN-2
   layer stores the decay `a` per (head, channel) rather than per head; default NNX
-  initializers instead of the paper's Xavier/`2^-2.5` scheme; no incremental-decode
-  state threading; group-limited MoE routing omitted.
+  initializers instead of the paper's Xavier/`2^-2.5` scheme; group-limited MoE
+  routing omitted; streaming prefill uses the recurrent core (chunkwise prefill
+  would be faster for long prompts).
 * **Numerical caveat:** the GDN-2 chunkwise core runs in fp32 and forms `exp(-G)`
   with `G` the cumulative log-decay. Very strong decay within a chunk can overflow
   (`exp(-G)=inf`, `exp(G)=0` → `0*inf=NaN`). Keep `gdn_chunk_size` modest and the

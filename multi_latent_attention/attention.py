@@ -1,6 +1,19 @@
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
+
+
+class MLACache(NamedTuple):
+    """Streaming KV cache for the MLA layer. Thanks to MLA we cache only the small
+    COMPRESSED latent `l_kv` (one latent serves as BOTH K and V — see below), in a
+    preallocated [B, max_len, Hkv*Dh] buffer written at position `pos`. Unlike GDN-2's
+    fixed-size state, this GROWS with context: these full-attention layers are exactly
+    the ones that pay the long-context KV-cache cost in the hybrid (3:1 keeps them few)."""
+
+    l_kv: jax.Array  # [B, max_len, num_kv_heads*head_dim]  preallocated latent buffer
+    pos: jax.Array  # scalar int32: number of filled positions so far
 
 
 class GroupedQueryLatentAttention(nnx.Module):
@@ -141,3 +154,63 @@ class GroupedQueryLatentAttention(nnx.Module):
         output = self.w_uv_o(weighted_latents)  # (B, T, embed_dim)
 
         return output
+
+    # ----------------------------------------------------------------------- #
+    #  Streaming / inference.  Same softmax attention, but the KV latents of past
+    #  positions are read from a preallocated cache instead of recomputed, and the
+    #  new positions are written into it.  Use it for prefill (L = prompt length)
+    #  and per-token decode (L = 1) alike.
+    # ----------------------------------------------------------------------- #
+    def init_cache(
+        self, batch_size: int, max_len: int, dtype=jnp.float32
+    ) -> MLACache:
+        """Empty cache: a zeroed latent buffer of capacity `max_len`, position 0."""
+        d_kv = self.num_kv_heads * self.head_dim
+        return MLACache(
+            l_kv=jnp.zeros((batch_size, max_len, d_kv), dtype),
+            pos=jnp.array(0, jnp.int32),
+        )
+
+    def step(self, x: jax.Array, cache: MLACache) -> tuple[jax.Array, MLACache]:
+        """Streaming attention. x: [B, L, embed_dim] (L>=1). Returns (out, new_cache)."""
+        B, L, _ = x.shape
+        max_len = cache.l_kv.shape[1]
+
+        # Queries for the new positions (already in the compressed K space via W_UK).
+        q_heads = (
+            self.w_q_uk(x)
+            .reshape(B, L, self.num_q_heads, self.head_dim)
+            .swapaxes(1, 2)
+        )  # (B, Hq, L, Dh)
+
+        # New latents -> write them into the cache buffer at the current position.
+        l_new = self.w_dkv(x)  # (B, L, Hkv*Dh)
+        l_kv = jax.lax.dynamic_update_slice(
+            cache.l_kv, l_new.astype(cache.l_kv.dtype), (0, cache.pos, 0)
+        )
+        new_pos = cache.pos + L
+
+        l_kv_heads = l_kv.reshape(
+            B, max_len, self.num_kv_heads, self.head_dim
+        ).swapaxes(1, 2)  # (B, Hkv, max_len, Dh)
+        l_kv_rep = l_kv_heads.repeat(self.group_size, axis=1)  # (B, Hq, max_len, Dh)
+
+        # Scores: the L new queries attend over all max_len cached slots.
+        logits = jnp.einsum(
+            "bhqd, bhkd -> bhqk", q_heads, l_kv_rep
+        ) / jnp.sqrt(self.head_dim)
+
+        # Causal mask offset by the cache position: query i sits at absolute position
+        # pos+i and may attend to slot j iff j <= pos+i.  This also masks the not-yet-
+        # filled slots (j >= pos+L > pos+i), so no separate validity mask is needed.
+        q_pos = cache.pos + jnp.arange(L)  # (L,)
+        k_pos = jnp.arange(max_len)  # (max_len,)
+        mask = k_pos[None, :] <= q_pos[:, None]  # (L, max_len)
+        logits = jnp.where(mask[None, None], logits, -jnp.inf)
+
+        a = jax.nn.softmax(logits, axis=-1)
+        weighted = jnp.einsum("bhqk, bhkd -> bhqd", a, l_kv_rep)  # (B, Hq, L, Dh)
+        weighted = weighted.swapaxes(1, 2).reshape(
+            B, L, self.num_q_heads * self.head_dim
+        )
+        return self.w_uv_o(weighted), MLACache(l_kv, new_pos)
