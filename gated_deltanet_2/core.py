@@ -33,7 +33,6 @@ hand-derived backward is only needed for a fused Triton/Pallas kernel.
 
 import jax
 import jax.numpy as jnp
-from flax.typing import F
 from jax import lax
 
 # math runs in fp32 (paper App. D.1/D.3/D.4)
