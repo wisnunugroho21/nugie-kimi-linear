@@ -100,7 +100,7 @@ class GroupedGemmMoE(nnx.Module):
         logits = self.router(x_flat).astype(F32)
         scores = jax.nn.sigmoid(logits)  # affinities [T,E]
 
-        sel = scores + self.router_bias.value if self.bias_balancing else scores
+        sel = scores + self.router_bias if self.bias_balancing else scores
         sel = jax.lax.stop_gradient(sel) if self.bias_balancing else sel
         _, top_idx = jax.lax.top_k(sel, self.top_k)  # selection [T,k]
 
@@ -110,9 +110,9 @@ class GroupedGemmMoE(nnx.Module):
         gate = gate * self.routed_scale
         return top_idx, gate, scores
 
-    def _shared(self, x_flat):
-        a = jax.nn.silu(x_flat @ self.ws_gate.value) * (x_flat @ self.ws_up.value)
-        return a @ self.ws_down.value
+    def _shared(self, x_flat: jax.Array) -> jax.Array:
+        a = jax.nn.silu(x_flat @ self.ws_gate) * (x_flat @ self.ws_up)
+        return a @ self.ws_down
 
     # ----------------------------------------------------------------------- #
     def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
@@ -137,11 +137,11 @@ class GroupedGemmMoE(nnx.Module):
         x_sorted = xf[sort_tok].astype(cdtype)  # [M, d], M = T*k
 
         # ---- grouped GEMM: one matmul per expert over its contiguous rows ----
-        h = jax.lax.ragged_dot(x_sorted, self.w_in.value.astype(cdtype), group_sizes)
+        h = jax.lax.ragged_dot(x_sorted, self.w_in.astype(cdtype), group_sizes)
         g_, u_ = jnp.split(h, 2, axis=-1)  # [M, d_ff] each
         a = jax.nn.silu(g_) * u_
         y_sorted = jax.lax.ragged_dot(
-            a, self.w_out.value.astype(cdtype), group_sizes
+            a, self.w_out.astype(cdtype), group_sizes
         )  # [M,d]
 
         # ---- combine: weight, un-permute, sum top-k per token ----
@@ -155,6 +155,8 @@ class GroupedGemmMoE(nnx.Module):
 
         # ---- diagnostics for the training loop ----
         load = group_sizes.astype(F32) / (T * k)  # fraction per expert
+
+        # ---- aux loss ----
         # Switch/DeepSeek aux loss: E * <f_e, P_e>, P from softmax routing probs.
         probs = jax.nn.softmax(self.router(xf).astype(F32), axis=-1).mean(0)  # [E]
         aux_loss = self.aux_alpha * self.E * jnp.sum(load * probs)
@@ -173,10 +175,10 @@ class GroupedGemmMoE(nnx.Module):
         full = (
             jnp.zeros((T, self.E), F32).at[jnp.arange(T)[:, None], top_idx].add(gate)
         )  # [T,E] sparse weights
-        h = jnp.einsum("td,edf->tef", xf, self.w_in.value)  # [T,E,2*d_ff]
+        h = jnp.einsum("td,edf->tef", xf, self.w_in)  # [T,E,2*d_ff]
         g_, u_ = jnp.split(h, 2, axis=-1)
         a = jax.nn.silu(g_) * u_
-        ye = jnp.einsum("tef,efd->ted", a, self.w_out.value)  # [T,E,d]
+        ye = jnp.einsum("tef,efd->ted", a, self.w_out)  # [T,E,d]
         routed = jnp.einsum("te,ted->td", full, ye)
         out = routed + self._shared(xf)
         return out.reshape(B, L, d)
@@ -189,8 +191,8 @@ def update_router_bias(
     """Aux-loss-free load balancing (DeepSeek-V3 style), called in the training loop
     AFTER each step, outside the gradient:
 
-        moe.router_bias.value = update_router_bias(
-            moe.router_bias.value, aux['group_sizes'], lr)
+        moe.router_bias = update_router_bias(
+            moe.router_bias, aux['group_sizes'], lr)
 
     Nudges the selection bias up for under-loaded experts and down for over-loaded
     ones by a fixed step, driving per-expert load toward uniform without an aux loss.

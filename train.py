@@ -36,7 +36,7 @@ import orbax.checkpoint as ocp
 from flax import nnx
 
 from kimi_linear_gdn2 import KimiLinear, KimiLinearConfig, count_params
-from multi_latent_attention.moe import update_router_bias
+from multi_latent_attention.moe import GroupedGemmMoE, update_router_bias
 
 
 # --------------------------------------------------------------------------- #
@@ -61,8 +61,8 @@ def cross_entropy(logits, targets):
 
 def next_token_accuracy(model, batch):
     """Token accuracy of the next-token prediction over a batch (eval only)."""
-    logits, _ = model(batch)
-    logits = logits[:, :-1]          # predict positions 1..L-1
+    full_logits, _ = model(batch)
+    logits = full_logits[:, :-1]  # predict positions 1..L-1
     preds = jnp.argmax(logits, axis=-1)
     return jnp.mean((preds == batch[:, 1:]).astype(jnp.float32))
 
@@ -78,7 +78,7 @@ def train_step(model: KimiLinear, optimizer: nnx.Optimizer, batch, bias_lr: floa
     # standard causal-LM training (position t's logits only see tokens <= t anyway).
     targets = batch[:, 1:]
 
-    def loss_fn(model):
+    def loss_fn(model: KimiLinear):
         # return_aux=True also gives the MoE load-balancing diagnostics.
         full_logits, aux = model(batch, return_aux=True)
         logits = full_logits[:, :-1]  # drop the last position's prediction
@@ -97,8 +97,9 @@ def train_step(model: KimiLinear, optimizer: nnx.Optimizer, batch, bias_lr: floa
     # per-expert selection bias toward uniform load. Done OUTSIDE the gradient, here
     # right after the optimizer step. group_sizes has one [E] vector per MoE layer.
     for layer, gsz in zip(model.layers, group_sizes):
-        rb = layer.channel_mixer.router_bias
-        rb.value = update_router_bias(rb.value, gsz, lr=bias_lr)
+        if isinstance(layer.channel_mixer, GroupedGemmMoE):
+            rb = layer.channel_mixer.router_bias
+            rb[...] = update_router_bias(rb[...], gsz, lr=bias_lr)
 
     return loss, ce
 
@@ -107,7 +108,7 @@ def train_step(model: KimiLinear, optimizer: nnx.Optimizer, batch, bias_lr: floa
 #  Train, then checkpoint round-trip.
 # --------------------------------------------------------------------------- #
 def main(
-    steps: int = 250,
+    steps: int = 10,
     batch_size: int = 32,
     seq_len: int = 32,
     vocab_size: int = 32,
@@ -136,14 +137,19 @@ def main(
         moe_top_k=2,
     )
     model = KimiLinear(cfg, rngs=nnx.Rngs(seed))
-    print(f"model: {count_params(model):,} params | "
-          f"full-attn (MLA) layers: {[i for i, l in enumerate(model.layers) if l.is_full_attn]} "
-          f"| the rest are GDN-2 linear-attention layers")
+    print(
+        f"model: {count_params(model):,} params | "
+        f"full-attn (MLA) layers: {[i for i, L in enumerate(model.layers) if L.is_full_attn]} "
+        f"| the rest are GDN-2 linear-attention layers"
+    )
 
     # --- Optax: clip -> AdamW, under a warmup-cosine learning-rate schedule. ---
     schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=lr, warmup_steps=max(1, steps // 20),
-        decay_steps=steps, end_value=lr * 0.1,
+        init_value=0.0,
+        peak_value=lr,
+        warmup_steps=max(1, steps // 20),
+        decay_steps=steps,
+        end_value=lr * 0.1,
     )
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -160,10 +166,14 @@ def main(
         key, sub = jax.random.split(key)
         batch = sample_batch(sub, batch_size, seq_len, vocab_size)
         loss, ce = train_step(model, optimizer, batch, bias_lr)
-        if step % 25 == 0 or step == 1:
-            acc = next_token_accuracy(model, held_out)  # generalization to unseen starts
-            print(f"step {step:4d} | loss {float(loss):.4f} | ce {float(ce):.4f} | "
-                  f"held-out acc {float(acc):.3f}")
+        if step % 1 == 0 or step == 1:
+            acc = next_token_accuracy(
+                model, held_out
+            )  # generalization to unseen starts
+            print(
+                f"step {step:4d} | loss {float(loss):.4f} | ce {float(ce):.4f} | "
+                f"held-out acc {float(acc):.3f} | MoE load {ce['load']}"
+            )
 
     # --- Orbax: save the model state, reload into a fresh model, verify equality. ---
     eval_ids = sample_batch(jax.random.PRNGKey(123), 4, seq_len, vocab_size)
@@ -172,7 +182,7 @@ def main(
     ckpt_dir = tempfile.mkdtemp()
     path = f"{ckpt_dir}/kimi_linear_state"
     checkpointer = ocp.StandardCheckpointer()
-    _, state = nnx.split(model)            # split graph (static) from state (arrays)
+    _, state = nnx.split(model)  # split graph (static) from state (arrays)
     checkpointer.save(path, state)
     checkpointer.wait_until_finished()
     print(f"\nsaved checkpoint -> {path}")
@@ -184,10 +194,12 @@ def main(
     restored = checkpointer.restore(path, abstract)
     nnx.update(fresh, restored)
 
-    new_logits = fresh(eval_ids)
+    new_logits, _ = fresh(eval_ids)
     max_diff = float(jnp.max(jnp.abs(ref_logits - new_logits)))
-    print(f"checkpoint reload max|Δlogits| = {max_diff:.2e}  "
-          f"({'OK' if max_diff < 1e-5 else 'MISMATCH'})")
+    print(
+        f"checkpoint reload max|Δlogits| = {max_diff:.2e}  "
+        f"({'OK' if max_diff < 1e-5 else 'MISMATCH'})"
+    )
 
 
 if __name__ == "__main__":

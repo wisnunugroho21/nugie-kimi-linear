@@ -112,7 +112,7 @@ class SwiGLUMLP(nnx.Module):
         self.up = nnx.Linear(d_model, d_ff, use_bias=False, rngs=rngs)
         self.down = nnx.Linear(d_ff, d_model, use_bias=False, rngs=rngs)
 
-    def __call__(self, x):
+    def __call__(self, x: jax.Array) -> jax.Array:
         return self.down(jax.nn.silu(self.gate(x)) * self.up(x))
 
 
