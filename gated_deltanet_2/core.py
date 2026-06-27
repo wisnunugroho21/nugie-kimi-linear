@@ -33,7 +33,11 @@ hand-derived backward is only needed for a fused Triton/Pallas kernel.
 
 import jax
 import jax.numpy as jnp
+from flax.typing import F
 from jax import lax
+
+# math runs in fp32 (paper App. D.1/D.3/D.4)
+D_TYPE = jnp.float32
 
 
 # --------------------------------------------------------------------------- #
@@ -55,16 +59,15 @@ def _chunkwise_single(
     dv = v.shape[-1]
     C = chunk_size
     N = L // C
-    cdtype = jnp.float32  # chunk math runs in fp32 (paper App. D.1/D.3/D.4)
 
     def to_chunks(x):
-        return x.reshape(N, C, x.shape[-1]).astype(cdtype)
+        return x.reshape(N, C, x.shape[-1]).astype(D_TYPE)
 
     q, k, v = to_chunks(q), to_chunks(k), to_chunks(v)
     g, b, w = to_chunks(g), to_chunks(b), to_chunks(w)
 
-    eye = jnp.eye(C, dtype=cdtype)
-    S0 = S0.astype(cdtype)
+    eye = jnp.eye(C, dtype=D_TYPE)
+    S0 = S0.astype(D_TYPE)
 
     def chunk_step(S, inp):
         # S is the raw chunk-entry state S_[n] (== S_0, NOT decay-normalized).
@@ -119,7 +122,7 @@ def _chunkwise_single(
         Aqk = jnp.tril(Qg @ Kbar.T)
 
         # Eq. 24/44:  O = Q_γ S_0 + A_qk (U − Y S_0)
-        O = Qg @ S + Aqk @ R
+        o = Qg @ S + Aqk @ R
 
         # --- End-of-chunk state -----------------------------------------------
         # Eq. 23/41:  (K_tail)_r = (γ_C / γ_r) ⊙ k_r
@@ -129,11 +132,11 @@ def _chunkwise_single(
         # Diag(γ_C) S_0: broadcast over key-channel rows (decay lives on key axis)
         S_new = gamma_C[:, None] * S + Ktail.T @ R
 
-        return S_new, O
+        return S_new, o
 
     # Cross-chunk recurrence: sequential scan over N = L/C chunks (Sec. 2.1 / Eq. 3 structure).
-    S_final, O = lax.scan(chunk_step, S0, (q, k, v, g, b, w))
-    return O.reshape(L, dv), S_final
+    S_final, o = lax.scan(chunk_step, S0, (q, k, v, g, b, w))
+    return o.reshape(L, dv), S_final
 
 
 def _recurrent_single(
@@ -151,13 +154,13 @@ def _recurrent_single(
     (I - k_t e_t^T) Diag(α_t) form of Eq. 10/29. O(L·dk·dv), no triangular solve —
     a trustworthy ground truth for verifying the chunkwise path.
     """
-    q = q.astype(jnp.float32)
-    k = k.astype(jnp.float32)
-    v = v.astype(jnp.float32)
-    g = g.astype(jnp.float32)
-    b = b.astype(jnp.float32)
-    w = w.astype(jnp.float32)
-    S0 = S0.astype(jnp.float32)
+    q = q.astype(D_TYPE)
+    k = k.astype(D_TYPE)
+    v = v.astype(D_TYPE)
+    g = g.astype(D_TYPE)
+    b = b.astype(D_TYPE)
+    w = w.astype(D_TYPE)
+    S0 = S0.astype(D_TYPE)
 
     alpha = jnp.exp(g)  # Eq. 12/30:  α_r = exp(g_r)
     e = b * k  # Eq. 8:      e_r = b_r ⊙ k_r
@@ -166,32 +169,38 @@ def _recurrent_single(
     def step(S, inp):
         qt, kt, at, et, zt = inp
 
+        qt = qt[:, None]
+        kt = kt[:, None]
+        at = at[:, None]
+        et = et[:, None]
+        zt = zt[:, None]
+
         # Eq. 9:  S̄_t = D_t S_{t-1} = Diag(α_t) S_{t-1} (scale key-channel rows)
-        S_bar = at[:, None] * S
+        S_bar = at * S
 
         # Eq. 9:  r_t = S̄_tᵀ e_t  (read old content along erase direction)
         r_t = S_bar.T @ et
 
         # Eq. 9/15:  S_t = S̄_t + k_t (z_t − r_t)ᵀ  (rank-one delta write)
-        S_new = S_bar + kt[:, None] * (zt - r_t)[None, :]
+        S_new = S_bar + kt * (zt - r_t).T
 
         # Eq. 1:  o_t = S_tᵀ q_t
         o_t = S_new.T @ qt
 
         return S_new, o_t
 
-    S_final, O = lax.scan(step, S0, (q, k, alpha, e, z))
-    return O, S_final
+    S_final, o = lax.scan(step, S0, (q, k, alpha, e, z))
+    return o.squeeze(-1), S_final
 
 
 # --------------------------------------------------------------------------- #
 #  Batched public entry points: inputs are [B, H, L, d].  (No equations here —
 #  pure plumbing: vmap the per-head algorithm over heads, then over batch.)
 # --------------------------------------------------------------------------- #
-def _batchify(fn):
+def _batchify(fn: (...)) -> ...:
     # vmap over heads (axis 1) then batch (axis 0); S0 has no L axis.
-    over_heads = jax.vmap(fn, in_axes=(0, 0, 0, 0, 0, 0, 0), out_axes=(0, 0))
-    return jax.vmap(over_heads, in_axes=(0, 0, 0, 0, 0, 0, 0), out_axes=(0, 0))
+    over_heads = jax.vmap(fn)
+    return jax.vmap(over_heads)
 
 
 def chunkwise_gated_delta_rule_2(
@@ -209,8 +218,19 @@ def chunkwise_gated_delta_rule_2(
     q, k, g, b : [B, H, L, dk]      v, w : [B, H, L, dv]      S0 : [B, H, dk, dv]
     returns (O : [B, H, L, dv], S_final : [B, H, dk, dv]).
     """
-    f = lambda *a: _chunkwise_single(*a, chunk_size=chunk_size)
-    return _batchify(f)(q, k, v, g, b, w, S0)
+
+    def fun(
+        Q: jax.Array,
+        K: jax.Array,
+        V: jax.Array,
+        G: jax.Array,
+        B: jax.Array,
+        W: jax.Array,
+        So: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return _chunkwise_single(Q, K, V, G, B, W, So, chunk_size=chunk_size)
+
+    return _batchify(fun)(q, k, v, g, b, w, S0)
 
 
 def recurrent_gated_delta_rule_2(

@@ -36,6 +36,88 @@ import jax.numpy as jnp
 
 from gated_deltanet_2.core import chunkwise_gated_delta_rule_2
 
+F32 = jnp.float32
+
+
+class RMSNorm(nnx.Module):
+    """Plain RMSNorm used for the pre-norms around mixer / channel-mixer."""
+
+    def __init__(self, dim: int, *, eps: float = 1e-5, rngs: nnx.Rngs):
+        self.eps = eps
+        self.weight = nnx.Param(jnp.ones((dim,)))
+
+    def __call__(self, x):
+        xf = x.astype(F32)
+        rms = jax.lax.rsqrt(jnp.mean(xf * xf, axis=-1, keepdims=True) + self.eps)
+        return (xf * rms).astype(x.dtype) * self.weight.value
+
+
+class LowRankLinear(nnx.Module):
+    """y = W_up(W_down x). The W↑(W↓·) factorization Kimi Linear uses for its
+    output gate and decay, kept at rank = head dim for parameter parity."""
+
+    def __init__(
+        self,
+        in_features: int,
+        rank: int,
+        out_features: int,
+        *,
+        use_bias: bool = False,
+        rngs: nnx.Rngs,
+    ):
+        self.down = nnx.Linear(in_features, rank, use_bias=False, rngs=rngs)
+        self.up = nnx.Linear(rank, out_features, use_bias=use_bias, rngs=rngs)
+
+    def __call__(self, x):
+        return self.up(self.down(x))
+
+
+class GatedRMSNorm(nnx.Module):
+    """Head-wise RMSNorm of the recurrent output, gated by a LOW-RANK SIGMOID gate.
+
+    Implements Kimi Linear Eq. 10's output stage:
+
+        Sigmoid(W↑g W↓g x) ⊙ RMSNorm(O)
+
+    Two corrections vs the GDN-2 paper block used in your gdn2_layer:
+      (1) sigmoid, not SiLU/swish  — Kimi Linear's ablation found the swish output
+          gate (GDN's choice) performs substantially worse than sigmoid, and they
+          adopt sigmoid across all experiments including their GDN hybrid baseline.
+      (2) low-rank gate (W↑ W↓), rank = head dim — Kimi Linear factorizes the gate
+          "to ensure a fair parameter comparison" against the full-attention baseline.
+
+    The gate is produced INSIDE the norm from the block input x, so the call site in
+    your layer collapses to `O = self.o_norm(O_heads, x)` (no separate gate_proj).
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        d_model: int,
+        inner_dim: int,
+        gate_rank: int,
+        *,
+        eps: float = 1e-5,
+        rngs: nnx.Rngs,
+    ):
+        self.eps = eps
+        self.head_dim = head_dim  # dv, the axis RMSNorm normalizes over (head-wise)
+        self.inner_dim = inner_dim  # Hv * dv, the full token-mixer output width
+        self.weight = nnx.Param(jnp.ones((head_dim,)))
+        self.gate = LowRankLinear(
+            d_model, gate_rank, inner_dim, use_bias=False, rngs=rngs
+        )
+
+    def __call__(self, O_heads, x):
+        """O_heads: [B, L, Hv, dv]   x: [B, L, d_model]  ->  [B, L, Hv*dv]."""
+        B, L, Hv, dv = O_heads.shape
+        o = O_heads.astype(F32)
+        rms = jax.lax.rsqrt(jnp.mean(o * o, axis=-1, keepdims=True) + self.eps)
+        o = o * rms * self.weight.value  # head-wise RMSNorm
+        g = jax.nn.sigmoid(self.gate(x).astype(F32))  # low-rank SIGMOID gate
+        g = g.reshape(B, L, Hv, dv)
+        return (o * g).reshape(B, L, Hv * dv)
+
 
 class ShortConv(nnx.Module):
     """Causal depthwise 1-D convolution — the 'Conv' boxes in Fig. 1 (Sec. 3.5).
@@ -67,27 +149,6 @@ class ShortConv(nnx.Module):
         )
         y = y + self.bias.value[None, :, None]
         return jnp.transpose(y, (0, 2, 1))  # [B, L, C]
-
-
-class GatedRMSNorm(nnx.Module):
-    """RMSNorm then SiLU output gate — the 'Norm' + gate path in Fig. 1.
-
-    Sec. 3.5 / Fig. 1 caption: "recurrent output is RMS-normalized, multiplied by a
-    separate SiLU output gate, and passed through the output projection." App. D.5
-    lists the RMSNorm+SiLU output gate among the family's training-recipe choices.
-    """
-
-    def __init__(self, dim: int, *, eps: float = 1e-5, rngs: nnx.Rngs):
-        self.eps = eps
-        self.weight = nnx.Param(jnp.ones((dim,)))
-
-    def __call__(self, x, gate):  # both [..., dim]
-        x = x.astype(jnp.float32)  # normalize in fp32
-        rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + self.eps)
-        x = x * rms * self.weight.value  # RMSNorm
-        return x * jax.nn.sigmoid(
-            gate.astype(jnp.float32)
-        )  # multiply by Sigmoid output gate
 
 
 class GatedDeltaNet2(nnx.Module):
@@ -130,8 +191,8 @@ class GatedDeltaNet2(nnx.Module):
         self.w_proj = nnx.Linear(
             d_model, v_proj_dim, use_bias=True, rngs=rngs
         )  # Proj_w, Eq. 85: w = σ(Proj_w x)
-        self.f_proj = nnx.Linear(
-            d_model, k_proj_dim, use_bias=True, rngs=rngs
+        self.f_proj = LowRankLinear(
+            d_model, self.dk, k_proj_dim, use_bias=True, rngs=rngs
         )  # Proj_f, Eq. 86 (log-decay)
 
         # Short causal convs on q, k, v (App. C.1: "short-convolutional projections for q, k, v").
@@ -151,10 +212,13 @@ class GatedDeltaNet2(nnx.Module):
         self.dt_bias = nnx.Param(jnp.full((self.H * self.dk,), -4.0))  # δ
 
         # Output gate + gated RMSNorm + output projection (Sec. 3.5 / App. D.5).
-        self.gate_proj = nnx.Linear(
-            d_model, v_proj_dim, use_bias=False, rngs=rngs
-        )  # SiLU output gate source
-        self.o_norm = GatedRMSNorm(self.dv, rngs=rngs)
+        self.o_norm = GatedRMSNorm(
+            head_dim=self.dv,
+            d_model=d_model,
+            inner_dim=self.Hv * self.dv,
+            gate_rank=self.dv,
+            rngs=rngs,
+        )
         self.o_proj = nnx.Linear(
             v_proj_dim, d_model, use_bias=False, rngs=rngs
         )  # back to d_model
@@ -212,24 +276,22 @@ class GatedDeltaNet2(nnx.Module):
         # GQA: repeat key-side tensors across value-head groups (Sec. 3.5 / App. C.1).
         #   q, k, g, b are repeated; v, w already live on the value-head axis.
         if self.group > 1:
-            rep = lambda t: jnp.repeat(t, self.group, axis=1)
+
+            def rep(t: jax.Array) -> jax.Array:
+                return jnp.repeat(t, self.group, axis=1)
+
             q, k, g, b = rep(q), rep(k), rep(g), rep(b)
 
         if initial_state is None:
             initial_state = jnp.zeros((B, self.Hv, self.dk, self.dv), jnp.float32)
 
         # Gated Delta Rule-2 chunkwise core (Eq. 10); the kernel forms cumsum γ internally (Eq. 30).
-        O, final_state = chunkwise_gated_delta_rule_2(
+        o, final_state = chunkwise_gated_delta_rule_2(
             q, k, v, g, b, w, initial_state, chunk_size=self.chunk_size
         )
 
         # Gated RMSNorm + output projection (Sec. 3.5 / App. D.5).
-        O = O.transpose(0, 2, 1, 3)  # [B,Hv,L,dv] -> [B,L,Hv,dv]
-        gate = self.gate_proj(x).reshape(
-            B, L, self.Hv, self.dv
-        )  # SiLU output gate (applied in o_norm)
-        O = self.o_norm(O, gate).reshape(
-            B, L, self.Hv * self.dv
-        )  # RMSNorm(O) · SiLU(gate)
-        out = self.o_proj(O.astype(x.dtype))  # project back to d_model
+        o = o.transpose(0, 2, 1, 3)  # [B,Hv,L,dv] -> [B,L,Hv,dv]
+        o = self.o_norm(o, x)  # low-rank sigmoid gate computed inside, from x
+        out = self.o_proj(o.astype(x.dtype))  # project back to d_model
         return out, final_state
