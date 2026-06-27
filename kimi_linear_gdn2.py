@@ -33,9 +33,14 @@ BLOCK STRUCTURE (standard pre-norm transformer; Fig. 2)
 
 MODEL = Embed -> [DecoderLayer] * n_layers -> RMSNorm -> LM head.
 
-Scope: training / full-sequence forward only. Incremental decoding (threading each
-GDN-2 layer's recurrent state + an MLA KV-cache) is intentionally omitted to keep
-the reference minimal; the hooks for it are noted inline.
+TWO FORWARD MODES
+-----------------
+  • Training / full sequence:  model(input_ids)  — parallel, GDN-2 via its chunkwise
+    core, MLA via a full causal-attention matrix.
+  • Streaming / inference:     model.step(ids, caches) and model.generate(...)  —
+    reuses per-layer state across calls so each new token is O(1) work for the GDN-2
+    layers (fixed-size recurrent state) and O(context) for the few MLA layers (growing
+    latent cache). See GatedDeltaNet2.step / GroupedQueryLatentAttention.step.
 """
 
 from __future__ import annotations
@@ -185,8 +190,8 @@ class DecoderLayer(nnx.Module):
         if isinstance(self.token_mixer, GroupedQueryLatentAttention):
             h = self.token_mixer(h)
         else:
-            # GDN-2 also returns its end-of-sequence recurrent state; unused in
-            # training. For streaming decode you'd carry this state across calls.
+            # GDN-2 also returns its end-of-sequence recurrent state; unused in the
+            # full-sequence (training) path. Streaming decode reuses it — see .step().
             h, _gdn_state = self.token_mixer(h)
         x = x + h
 
@@ -195,6 +200,24 @@ class DecoderLayer(nnx.Module):
         m, aux = self.channel_mixer(y)
         x = x + m
         return x, aux
+
+    def init_cache(self, batch_size: int, max_len: int, dtype=jnp.float32):
+        """Per-layer streaming cache: a GDN2Cache (linear layer) or MLACache (MLA)."""
+        return self.token_mixer.init_cache(batch_size, max_len, dtype)
+
+    def step(self, x: jax.Array, cache):
+        """Streaming forward for one block. x: [B, L, d_model] -> (x, new_cache).
+        Only the token mixer is stateful; the channel mixer (MoE/MLP) is position-wise,
+        so it needs no cache."""
+        h = self.norm1(x)
+        h, new_cache = self.token_mixer.step(h, cache)  # GDN-2 and MLA both expose .step
+        x = x + h
+        y = self.norm2(x)
+        m = self.channel_mixer(y)
+        if isinstance(self.channel_mixer, GroupedGemmMoE):
+            m = m[0]  # MoE returns (out, aux); drop the aux during inference
+        x = x + m
+        return x, new_cache
 
 
 # --------------------------------------------------------------------------- #
@@ -243,6 +266,52 @@ class KimiLinear(nnx.Module):
         logits = self.lm_head(x)  # [B, L, vocab]
 
         return logits, {"aux_loss": aux_loss, "group_sizes": jnp.stack(group_sizes)}
+
+    # ----------------------------------------------------------------------- #
+    #  Streaming / inference.  Each layer carries its own cache (GDN-2: fixed-size
+    #  recurrent state + conv state; MLA: growing latent cache).  Reusing them makes
+    #  generation O(1) per token for the linear layers instead of re-reading history.
+    # ----------------------------------------------------------------------- #
+    def init_cache(
+        self, batch_size: int, max_len: int | None = None, dtype=jnp.float32
+    ) -> list:
+        """Streaming caches for every layer. `max_len` (default cfg.max_seq_len) sizes
+        the MLA latent buffers; GDN-2 layers ignore it (their state is fixed-size)."""
+        max_len = max_len or self.cfg.max_seq_len
+        return [layer.init_cache(batch_size, max_len, dtype) for layer in self.layers]
+
+    def step(self, input_ids: jax.Array, caches: list) -> tuple[jax.Array, list]:
+        """One streaming step. input_ids: int[B, L] (L = prompt length on prefill, or
+        1 per decoded token). Returns (logits[B, L, vocab], new_caches)."""
+        x = self.embed(input_ids)
+        new_caches = []
+        for layer, cache in zip(self.layers, caches):
+            x, new_cache = layer.step(x, cache)
+            new_caches.append(new_cache)
+        x = self.norm_f(x)
+        return self.lm_head(x), new_caches
+
+    def generate(
+        self, prompt_ids: jax.Array, max_new_tokens: int, max_len: int | None = None
+    ) -> jax.Array:
+        """Greedy autoregressive decode that REUSES each layer's state across steps.
+        prompt_ids: int[B, P]. Returns the continuation int[B, max_new_tokens].
+
+        Prefill consumes the whole prompt in one step (filling every layer's cache);
+        each decode step then feeds back ONE token and carries the caches forward — the
+        GDN-2 layers via their fixed-size recurrent state, the MLA layers via the
+        growing latent cache. (Wrap `step` in nnx.jit for a fast decode loop.)"""
+        B, P = prompt_ids.shape
+        max_len = max_len or (P + max_new_tokens)
+        caches = self.init_cache(B, max_len)
+        logits, caches = self.step(prompt_ids, caches)  # prefill the prompt
+        next_tok = jnp.argmax(logits[:, -1:], axis=-1)  # [B, 1] greedy
+        outs = [next_tok]
+        for _ in range(max_new_tokens - 1):
+            logits, caches = self.step(next_tok, caches)  # decode one token
+            next_tok = jnp.argmax(logits[:, -1:], axis=-1)
+            outs.append(next_tok)
+        return jnp.concatenate(outs, axis=1)  # [B, max_new_tokens]
 
 
 def count_params(model: nnx.Module) -> int:

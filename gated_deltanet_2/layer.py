@@ -30,13 +30,36 @@ Two honest deviations from the paper, flagged inline below:
       and zero biases (except the decay bias, set negative here for fp32 safety).
 """
 
+from typing import NamedTuple
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 
-from gated_deltanet_2.core import chunkwise_gated_delta_rule_2
+from gated_deltanet_2.core import (
+    chunkwise_gated_delta_rule_2,
+    recurrent_gated_delta_rule_2,
+)
 
 F32 = jnp.float32
+
+
+# --------------------------------------------------------------------------- #
+#  Inference cache for streaming (incremental) decode.
+#
+#  Linear attention's headline property: the entire history collapses into a
+#  FIXED-SIZE recurrent state S [B,Hv,dk,dv] — it does NOT grow with sequence
+#  length (contrast a softmax KV-cache). To decode token-by-token we just carry S
+#  across calls.  The short causal conv ALSO has a (kernel_size)-wide receptive
+#  field, so we must additionally cache its last (kernel_size-1) inputs — otherwise
+#  the first streamed tokens would see wrong, zero-padded context.  That is the
+#  WHOLE state of a GDN-2 layer; both pieces are fixed-size.
+# --------------------------------------------------------------------------- #
+class GDN2Cache(NamedTuple):
+    recurrent_state: jax.Array  # [B, Hv, dk, dv]  the gated-delta-rule memory S
+    q_conv: jax.Array  # [B, conv_size-1, H*dk]   last inputs to the q short-conv
+    k_conv: jax.Array  # [B, conv_size-1, H*dk]   last inputs to the k short-conv
+    v_conv: jax.Array  # [B, conv_size-1, Hv*dv]  last inputs to the v short-conv
 
 
 class RMSNorm(nnx.Module):
@@ -134,21 +157,32 @@ class ShortConv(nnx.Module):
         self.weight = nnx.Param(w)
         self.bias = nnx.Param(jnp.zeros((channels,)))
 
-    def __call__(self, x):  # x: [B, L, C]
-        xt = jnp.transpose(x, (0, 2, 1))  # [B, C, L]
-        xt = jnp.pad(
-            xt, ((0, 0), (0, 0), (self.kernel_size - 1, 0))
-        )  # causal pad (left-only)
+    def _apply(self, x, conv_state):
+        """Shared conv core. `conv_state` is the previous (kernel_size-1) inputs used
+        as left context, or None on the full/training path (pad with zeros == the
+        causal left-pad). Returns (y: [B, L, C], new_state: [B, kernel_size-1, C])."""
+        B, L, C = x.shape
+        kc = self.kernel_size - 1
+        left = jnp.zeros((B, kc, C), x.dtype) if conv_state is None else conv_state
+        xc = jnp.concatenate([left, x], axis=1)  # [B, kc+L, C]  prepend left context
+        new_state = xc[:, xc.shape[1] - kc :, :]  # last kc inputs -> next step's context
+        xt = jnp.transpose(xc, (0, 2, 1))  # [B, C, kc+L]
         y = jax.lax.conv_general_dilated(
             xt,
             self.weight.value,
             window_strides=(1,),
-            padding="VALID",
+            padding="VALID",  # out length (kc+L)-(kc+1)+1 = L; output t sees inputs t-kc..t
             feature_group_count=self.channels,  # depthwise: one filter per channel
             dimension_numbers=("NCW", "OIW", "NCW"),
         )
         y = y + self.bias.value[None, :, None]
-        return jnp.transpose(y, (0, 2, 1))  # [B, L, C]
+        return jnp.transpose(y, (0, 2, 1)), new_state  # [B, L, C]
+
+    def __call__(self, x):  # full-sequence (training) path; left context = zeros
+        return self._apply(x, None)[0]
+
+    def step(self, x, conv_state):  # streaming path; carry the left context in/out
+        return self._apply(x, conv_state)
 
 
 class GatedDeltaNet2(nnx.Module):
@@ -175,6 +209,7 @@ class GatedDeltaNet2(nnx.Module):
         self.dk = head_k_dim
         self.dv = head_v_dim
         self.chunk_size = chunk_size
+        self.conv_size = conv_size  # kernel width; sizes the streaming conv cache
         self.expanded_erase = expanded_erase
 
         # App. C.1 projection shapes: erase/key side -> H·d_k, write/value side -> H_v·d_v.
@@ -233,16 +268,28 @@ class GatedDeltaNet2(nnx.Module):
         # Head reshaping for value-side tensors.
         return x.reshape(B, L, self.Hv, self.dv).transpose(0, 2, 1, 3)  # [B,Hv,L,dv]
 
-    def __call__(
-        self, x: jax.Array, initial_state: jax.Array | None = None
-    ) -> tuple[jax.Array, jax.Array]:
-        """x: [B, L, d_model]. Returns (out: [B, L, d_model], final_state: [B,Hv,dk,dv])."""
+    def _project(self, x, conv_states):
+        """Shared front-end used by BOTH the training and streaming paths:
+        Linear -> ShortConv -> SiLU -> head split -> L2 norm, plus the log-decay g
+        and the channel-wise gates b, w.  `conv_states` is None on the full/training
+        path, or a (q, k, v) tuple of conv caches when streaming.  Returns
+        (q, k, v, g, b, w) on the value-head (Hv) axis and the updated conv states
+        (or None)."""
         B, L, _ = x.shape
 
         # q,k,v paths: Linear -> ShortConv -> SiLU (Sec. 3.5; Fig. 1 caption).
-        q = jax.nn.silu(self.q_conv(self.q_proj(x)))
-        k = jax.nn.silu(self.k_conv(self.k_proj(x)))
-        v = jax.nn.silu(self.v_conv(self.v_proj(x)))
+        if conv_states is None:  # full/training: conv pads with zeros (causal)
+            q = self.q_conv(self.q_proj(x))
+            k = self.k_conv(self.k_proj(x))
+            v = self.v_conv(self.v_proj(x))
+            new_conv = None
+        else:  # streaming: conv uses the cached left context and returns a new one
+            qcs, kcs, vcs = conv_states
+            q, qcs = self.q_conv.step(self.q_proj(x), qcs)
+            k, kcs = self.k_conv.step(self.k_proj(x), kcs)
+            v, vcs = self.v_conv.step(self.v_proj(x), vcs)
+            new_conv = (qcs, kcs, vcs)
+        q, k, v = jax.nn.silu(q), jax.nn.silu(k), jax.nn.silu(v)
 
         q = self._split_k(q, B, L)
         k = self._split_k(k, B, L)
@@ -267,12 +314,8 @@ class GatedDeltaNet2(nnx.Module):
         b = jax.nn.sigmoid(self.b_proj(x))  # b = σ(Proj_b x) ∈ [0,1]^{d_k}
         b = self._split_k(b, B, L)
         if self.expanded_erase:
-            b = (
-                2.0 * b
-            )  # neg-eigenvalue variant: scale ONLY b to [0,2] (Sec. 3.1 / App. C.1)
-        w = jax.nn.sigmoid(
-            self.w_proj(x)
-        )  # w = σ(Proj_w x) ∈ [0,1]^{d_v}  (write gate stays in [0,1])
+            b = 2.0 * b  # neg-eigenvalue variant: scale ONLY b to [0,2] (Sec. 3.1)
+        w = jax.nn.sigmoid(self.w_proj(x))  # w = σ(Proj_w x) ∈ [0,1]^{d_v}
         w = self._split_v(w, B, L)
 
         # GQA: repeat key-side tensors across value-head groups (Sec. 3.5 / App. C.1).
@@ -284,16 +327,59 @@ class GatedDeltaNet2(nnx.Module):
 
             q, k, g, b = rep(q), rep(k), rep(g), rep(b)
 
-        if initial_state is None:
-            initial_state = jnp.zeros((B, self.Hv, self.dk, self.dv), jnp.float32)
+        return q, k, v, g, b, w, new_conv
 
-        # Gated Delta Rule-2 chunkwise core (Eq. 10); the kernel forms cumsum γ internally (Eq. 30).
-        o, _final_state = chunkwise_gated_delta_rule_2(
-            q, k, v, g, b, w, initial_state, chunk_size=self.chunk_size
-        )
-
-        # Gated RMSNorm + output projection (Sec. 3.5 / App. D.5).
+    def _output(self, o: jax.Array, x: jax.Array) -> jax.Array:
+        """Gated RMSNorm + output projection (Sec. 3.5 / App. D.5). o: [B,Hv,L,dv]."""
         o = o.transpose(0, 2, 1, 3)  # [B,Hv,L,dv] -> [B,L,Hv,dv]
         o = self.o_norm(o, x)  # low-rank sigmoid gate computed inside, from x
-        out = self.o_proj(o.astype(x.dtype))  # project back to d_model
-        return out, _final_state
+        return self.o_proj(o.astype(x.dtype))  # project back to d_model
+
+    def __call__(
+        self, x: jax.Array, initial_state: jax.Array | None = None
+    ) -> tuple[jax.Array, jax.Array]:
+        """Full-sequence (training) forward via the CHUNKWISE parallel core.
+        x: [B, L, d_model]. Returns (out: [B, L, d_model], final_state: [B,Hv,dk,dv])."""
+        B, L, _ = x.shape
+        q, k, v, g, b, w, _ = self._project(x, conv_states=None)
+        if initial_state is None:
+            initial_state = jnp.zeros((B, self.Hv, self.dk, self.dv), jnp.float32)
+        # Gated Delta Rule-2 chunkwise core (Eq. 10); forms cumsum γ internally (Eq. 30).
+        o, final_state = chunkwise_gated_delta_rule_2(
+            q, k, v, g, b, w, initial_state, chunk_size=self.chunk_size
+        )
+        return self._output(o, x), final_state
+
+    # ----------------------------------------------------------------------- #
+    #  Streaming / inference.  Same math, but via the RECURRENT core, which works
+    #  for ANY length (no chunk-size divisibility constraint) and naturally threads
+    #  the fixed-size state in -> out.  One method serves both phases of decoding:
+    #     prefill: out, cache = layer.step(prompt, layer.init_cache(B, ...))
+    #     decode : out, cache = layer.step(one_token, cache)   # repeat
+    # ----------------------------------------------------------------------- #
+    def init_cache(
+        self, batch_size: int, max_len: int | None = None, dtype=jnp.float32
+    ) -> GDN2Cache:
+        """Empty streaming cache. `max_len` is accepted for a uniform interface with
+        the MLA cache but UNUSED here — the GDN-2 state is fixed-size, independent of
+        sequence length (the point of linear attention)."""
+        kc = self.conv_size - 1
+        return GDN2Cache(
+            recurrent_state=jnp.zeros(
+                (batch_size, self.Hv, self.dk, self.dv), jnp.float32
+            ),
+            q_conv=jnp.zeros((batch_size, kc, self.H * self.dk), dtype),
+            k_conv=jnp.zeros((batch_size, kc, self.H * self.dk), dtype),
+            v_conv=jnp.zeros((batch_size, kc, self.Hv * self.dv), dtype),
+        )
+
+    def step(self, x: jax.Array, cache: GDN2Cache) -> tuple[jax.Array, GDN2Cache]:
+        """Streaming forward. x: [B, L, d_model] (L>=1). Returns (out, new_cache)."""
+        q, k, v, g, b, w, (qcs, kcs, vcs) = self._project(
+            x, conv_states=(cache.q_conv, cache.k_conv, cache.v_conv)
+        )
+        # Recurrent core: token-by-token, threading S_in -> S_out (Eq. 9 / 29).
+        o, new_state = recurrent_gated_delta_rule_2(
+            q, k, v, g, b, w, cache.recurrent_state
+        )
+        return self._output(o, x), GDN2Cache(new_state, qcs, kcs, vcs)

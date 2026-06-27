@@ -101,7 +101,9 @@ def train_step(model: KimiLinear, optimizer: nnx.Optimizer, batch, bias_lr: floa
             rb = layer.channel_mixer.router_bias
             rb[...] = update_router_bias(rb[...], gsz, lr=bias_lr)
 
-    return loss, ce
+    # MoE load-balance health: worst-case per-expert share of tokens (1/E = balanced).
+    load = group_sizes / (group_sizes.sum(-1, keepdims=True) + 1e-9)  # [n_layers, E]
+    return loss, ce, jnp.max(load)
 
 
 # --------------------------------------------------------------------------- #
@@ -165,14 +167,14 @@ def main(
     for step in range(1, steps + 1):
         key, sub = jax.random.split(key)
         batch = sample_batch(sub, batch_size, seq_len, vocab_size)
-        loss, ce = train_step(model, optimizer, batch, bias_lr)
+        loss, ce, max_load = train_step(model, optimizer, batch, bias_lr)
         if step % 1 == 0 or step == 1:
             acc = next_token_accuracy(
                 model, held_out
             )  # generalization to unseen starts
             print(
                 f"step {step:4d} | loss {float(loss):.4f} | ce {float(ce):.4f} | "
-                f"held-out acc {float(acc):.3f} | MoE load {ce['load']}"
+                f"held-out acc {float(acc):.3f} | MoE max-load {float(max_load):.3f}"
             )
 
     # --- Orbax: save the model state, reload into a fresh model, verify equality. ---
