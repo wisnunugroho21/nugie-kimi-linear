@@ -94,7 +94,6 @@ class KimiLinearConfig:
     max_seq_len: int = 512  # builds the causal mask; cap on trainable length
 
     # --- Channel mixer (FFN) ---
-    use_moe: bool = True  # True -> MoE (faithful); False -> dense SwiGLU MLP
     moe_d_ff: int = 512  # per-expert hidden width (paper: 1408 at 1.3B)
     moe_n_routed: int = 8  # number of routed experts E (paper: 256)
     moe_n_shared: int = 1  # always-on shared experts
@@ -102,23 +101,6 @@ class KimiLinearConfig:
     mlp_d_ff: int = 768  # hidden width of the dense MLP fallback
 
     rms_eps: float = 1e-5
-
-
-# --------------------------------------------------------------------------- #
-#  Dense SwiGLU MLP — the non-MoE channel mixer.
-#
-#  Kimi Linear itself is an MoE model, so `use_moe=True` is the faithful path. This
-#  small dense alternative exists only to make tiny single-GPU/CPU runs trivial and
-#  to show the channel mixer in its simplest form: SwiGLU = (SiLU(xW_g) * xW_u) W_d.
-# --------------------------------------------------------------------------- #
-class SwiGLUMLP(nnx.Module):
-    def __init__(self, d_model: int, d_ff: int, *, rngs: nnx.Rngs):
-        self.gate = nnx.Linear(d_model, d_ff, use_bias=False, rngs=rngs)
-        self.up = nnx.Linear(d_model, d_ff, use_bias=False, rngs=rngs)
-        self.down = nnx.Linear(d_ff, d_model, use_bias=False, rngs=rngs)
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        return self.down(jax.nn.silu(self.gate(x)) * self.up(x))
 
 
 # --------------------------------------------------------------------------- #
@@ -166,18 +148,14 @@ class DecoderLayer(nnx.Module):
         self.norm2 = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
 
         # Channel mixer: MoE (faithful) or dense SwiGLU (minimal).
-        self.is_moe = cfg.use_moe
-        if cfg.use_moe:
-            self.channel_mixer = GroupedGemmMoE(
-                d_model=cfg.d_model,
-                d_ff=cfg.moe_d_ff,
-                n_routed=cfg.moe_n_routed,
-                n_shared=cfg.moe_n_shared,
-                top_k=cfg.moe_top_k,
-                rngs=rngs,
-            )
-        else:
-            self.channel_mixer = SwiGLUMLP(cfg.d_model, cfg.mlp_d_ff, rngs=rngs)
+        self.channel_mixer = GroupedGemmMoE(
+            d_model=cfg.d_model,
+            d_ff=cfg.moe_d_ff,
+            n_routed=cfg.moe_n_routed,
+            n_shared=cfg.moe_n_shared,
+            top_k=cfg.moe_top_k,
+            rngs=rngs,
+        )
 
     def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
         """x: [B, L, d_model] -> (x, aux_or_None).
@@ -210,12 +188,12 @@ class DecoderLayer(nnx.Module):
         Only the token mixer is stateful; the channel mixer (MoE/MLP) is position-wise,
         so it needs no cache."""
         h = self.norm1(x)
-        h, new_cache = self.token_mixer.step(h, cache)  # GDN-2 and MLA both expose .step
+        h, new_cache = self.token_mixer.step(
+            h, cache
+        )  # GDN-2 and MLA both expose .step
         x = x + h
         y = self.norm2(x)
-        m = self.channel_mixer(y)
-        if isinstance(self.channel_mixer, GroupedGemmMoE):
-            m = m[0]  # MoE returns (out, aux); drop the aux during inference
+        m, _aux = self.channel_mixer(y)
         x = x + m
         return x, new_cache
 
