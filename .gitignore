@@ -4,3 +4,5 @@ __pycache__/
 # Orbax checkpoints
 *.orbax-checkpoint-tmp-*/
 /checkpoints/
+# tokenized Project Gutenberg cache (train_chat_gutenberg.py)
+gutenberg_*.npy

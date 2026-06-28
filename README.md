@@ -58,18 +58,28 @@ verifies that streaming token-by-token reproduces the full-sequence forward exac
 | `multi_latent_attention/attention.py` | **MLA** full-attention in the absorbed, NoPE, GQA form (shared KV latent acts as both K and V). |
 | `multi_latent_attention/moe.py` | Token-dispatched **grouped-GEMM MoE** with a shared expert + aux-loss-free load balancing. |
 | `train.py` | **Training + checkpoint demo**: Optax (AdamW + clip + warmup-cosine) and Orbax (save/restore). |
+| `train_chat_gutenberg.py` | **Real-data training + chat**: Project Gutenberg via HuggingFace `datasets`/`transformers`, batched with `grain`; trains with per-step eval, then an interactive chat REPL. |
 | `sanity_check.py` | Correctness checks (parallel paths == reference paths). |
 
 ## Run
 
 ```bash
-python sanity_check.py   # verify the building blocks
-python train.py          # train the toy model + round-trip an Orbax checkpoint
+python sanity_check.py          # verify the building blocks
+python train.py                 # toy task + round-trip an Orbax checkpoint
+
+pip install grain datasets transformers   # extra deps for the next one
+python train_chat_gutenberg.py  # train on Project Gutenberg, then chat
 ```
 
 `train.py` learns a "continue the counting sequence" task and generalizes to
 held-out starts (held-out accuracy → 1.0), then reloads its Orbax checkpoint and
 checks the logits are bit-identical.
+
+`train_chat_gutenberg.py` streams Project Gutenberg through a Grain + HuggingFace
+pipeline (GPT-2 tokenizer), trains the model while printing **train vs. held-out loss
+every step**, then drops into an infinite **chat** loop that continues your prompt via
+the streaming `generate`. It's a tiny model on CPU, so loss drops but the prose stays
+rough; press Ctrl-C during training to jump straight to chat (`/exit` to quit).
 
 ## Faithfulness notes
 

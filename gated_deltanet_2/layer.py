@@ -165,7 +165,9 @@ class ShortConv(nnx.Module):
         kc = self.kernel_size - 1
         left = jnp.zeros((B, kc, C), x.dtype) if conv_state is None else conv_state
         xc = jnp.concatenate([left, x], axis=1)  # [B, kc+L, C]  prepend left context
-        new_state = xc[:, xc.shape[1] - kc :, :]  # last kc inputs -> next step's context
+        new_state = xc[
+            :, xc.shape[1] - kc :, :
+        ]  # last kc inputs -> next step's context
         xt = jnp.transpose(xc, (0, 2, 1))  # [B, C, kc+L]
         y = jax.lax.conv_general_dilated(
             xt,
@@ -268,7 +270,17 @@ class GatedDeltaNet2(nnx.Module):
         # Head reshaping for value-side tensors.
         return x.reshape(B, L, self.Hv, self.dv).transpose(0, 2, 1, 3)  # [B,Hv,L,dv]
 
-    def _project(self, x, conv_states):
+    def _project(
+        self, x: jax.Array, conv_states: tuple[jax.Array, jax.Array, jax.Array] | None
+    ) -> tuple[
+        jax.Array,
+        jax.Array,
+        jax.Array,
+        jax.Array,
+        jax.Array,
+        jax.Array,
+        tuple[jax.Array, jax.Array, jax.Array] | None,
+    ]:
         """Shared front-end used by BOTH the training and streaming paths:
         Linear -> ShortConv -> SiLU -> head split -> L2 norm, plus the log-decay g
         and the channel-wise gates b, w.  `conv_states` is None on the full/training

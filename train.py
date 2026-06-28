@@ -133,7 +133,6 @@ def main(
         mla_num_kv_heads=2,
         mla_head_dim=32,
         max_seq_len=seq_len,
-        use_moe=True,
         moe_d_ff=128,
         moe_n_routed=6,
         moe_top_k=2,
