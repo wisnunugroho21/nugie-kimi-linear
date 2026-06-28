@@ -85,12 +85,13 @@ rough; press Ctrl-C during training to jump straight to chat (`/exit` to quit).
 
 * **Kept as in the paper:** 3:1 linear/full hybrid, NoPE MLA, MoE FFN, pre-norm
   RMSNorm blocks, GDN-2's chunkwise WY recurrence, channel-wise gating, L2-normed
-  q/k, sigmoid output gate.
+  q/k, sigmoid output gate, Xavier-uniform init with gain `2^{-2.5}` and zero biases
+  (App. D.5).
 * **Deliberate simplifications (flagged inline):** tiny default dims; the GDN-2
-  layer stores the decay `a` per (head, channel) rather than per head; default NNX
-  initializers instead of the paper's Xavier/`2^-2.5` scheme; group-limited MoE
-  routing omitted; streaming prefill uses the recurrent core (chunkwise prefill
-  would be faster for long prompts).
+  layer stores the decay `a` per (head, channel) rather than per head; the decay bias
+  δ starts at −4 (not the paper's value) for fp32 safety; group-limited MoE routing
+  omitted; streaming prefill uses the recurrent core (chunkwise prefill would be faster
+  for long prompts).
 * **Numerical caveat:** the GDN-2 chunkwise core runs in fp32 and forms `exp(-G)`
   with `G` the cumulative log-decay. Very strong decay within a chunk can overflow
   (`exp(-G)=inf`, `exp(G)=0` → `0*inf=NaN`). Keep `gdn_chunk_size` modest and the

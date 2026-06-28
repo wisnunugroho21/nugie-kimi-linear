@@ -29,6 +29,11 @@ import jax.numpy as jnp
 
 F32 = jnp.float32
 
+# App. D.5: Xavier-uniform init with gain 2^{-2.5} (variance_scaling scale = gain² =
+# 2^{-5}), replacing Flax NNX's default Linear kernel init. Biases stay at zero (the
+# NNX default). The stacked expert weights below keep their own explicit fan-in init.
+_XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
+
 
 class GroupedGemmMoE(nnx.Module):
     """Token-dispatched grouped-GEMM MoE with a shared expert.
@@ -68,7 +73,9 @@ class GroupedGemmMoE(nnx.Module):
         self.bias_balancing = bias_balancing
         self.aux_alpha = aux_alpha
 
-        self.router = nnx.Linear(d_model, n_routed, use_bias=False, rngs=rngs)
+        self.router = nnx.Linear(
+            d_model, n_routed, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+        )
         self.router_bias = nnx.Variable(jnp.zeros((n_routed,), F32))
 
         # Stacked routed-expert weights. Gate and up are fused into W_in so the

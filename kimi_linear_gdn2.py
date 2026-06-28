@@ -57,6 +57,11 @@ from gated_deltanet_2.layer import GatedDeltaNet2, RMSNorm
 from multi_latent_attention.attention import GroupedQueryLatentAttention
 from multi_latent_attention.moe import GroupedGemmMoE
 
+# App. D.5: Xavier-uniform init with gain 2^{-2.5} (variance_scaling scale = gain² =
+# 2^{-5}) for the embedding and LM head, replacing Flax NNX's defaults. The (small)
+# embedding scale this produces is fine — RMSNorm renormalizes the residual stream.
+_XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
+
 
 # --------------------------------------------------------------------------- #
 #  Configuration
@@ -165,12 +170,7 @@ class DecoderLayer(nnx.Module):
         """
         # --- token mixing (residual, pre-norm) ---
         h = self.norm1(x)
-        if isinstance(self.token_mixer, GroupedQueryLatentAttention):
-            h = self.token_mixer(h)
-        else:
-            # GDN-2 also returns its end-of-sequence recurrent state; unused in the
-            # full-sequence (training) path. Streaming decode reuses it — see .step().
-            h, _gdn_state = self.token_mixer(h)
+        h = self.token_mixer(h)
         x = x + h
 
         # --- channel mixing (residual, pre-norm) ---
@@ -207,7 +207,9 @@ class KimiLinear(nnx.Module):
     def __init__(self, cfg: KimiLinearConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
         # Token embedding table.
-        self.embed = nnx.Embed(cfg.vocab_size, cfg.d_model, rngs=rngs)
+        self.embed = nnx.Embed(
+            cfg.vocab_size, cfg.d_model, embedding_init=_XAVIER, rngs=rngs
+        )
         # Stack of decoder blocks. NOTE: in Flax NNX a plain Python list of submodules
         # is not tracked as state — it must be wrapped in nnx.List(...).
         self.layers = nnx.List(
@@ -217,7 +219,7 @@ class KimiLinear(nnx.Module):
         # to tie, drop lm_head and use `x @ self.embed.embedding.value.T` instead).
         self.norm_f = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
         self.lm_head = nnx.Linear(
-            cfg.d_model, cfg.vocab_size, use_bias=False, rngs=rngs
+            cfg.d_model, cfg.vocab_size, use_bias=False, kernel_init=_XAVIER, rngs=rngs
         )
 
     def __call__(

@@ -4,6 +4,10 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+# App. D.5: Xavier-uniform init with gain 2^{-2.5} (variance_scaling scale = gain² =
+# 2^{-5}), replacing Flax NNX's default Linear kernel init. Biases stay at zero.
+_XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
+
 
 class MLACache(NamedTuple):
     """Streaming KV cache for the MLA layer. Thanks to MLA we cache only the small
@@ -66,11 +70,17 @@ class GroupedQueryLatentAttention(nnx.Module):
         d_kv = num_kv_heads * head_dim  # total width of the (shared) KV latent
 
         # W_Q . W_UK absorbed: x -> queries already living in the latent K space.
-        self.w_q_uk = nnx.Linear(embed_dim, d_q, use_bias=False, rngs=rngs)
+        self.w_q_uk = nnx.Linear(
+            embed_dim, d_q, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+        )
         # W_DKV: x -> low-rank KV latent c_kv (one latent per KV head).
-        self.w_dkv = nnx.Linear(embed_dim, d_kv, use_bias=False, rngs=rngs)
+        self.w_dkv = nnx.Linear(
+            embed_dim, d_kv, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+        )
         # W_UV . W_O absorbed: value-latent -> up-projected, output-projected.
-        self.w_uv_o = nnx.Linear(d_q, embed_dim, use_bias=False, rngs=rngs)
+        self.w_uv_o = nnx.Linear(
+            d_q, embed_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+        )
 
         # Lower-triangular causal mask (True = keep), built once at the
         # construction seq_length and sliced at call time, so it also covers any

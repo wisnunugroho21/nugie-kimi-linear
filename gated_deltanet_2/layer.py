@@ -26,8 +26,9 @@ Two honest deviations from the paper, flagged inline below:
   (1) A_log is stored per (head, key-channel); App. C.1 stores 'a' per key HEAD and
       broadcasts it over d_k. This implementation is a strict generalization (tie the
       d_k columns to recover the paper).
-  (2) Init uses Flax NNX defaults; App. D.5 specifies Xavier-uniform with gain 2^{-2.5}
-      and zero biases (except the decay bias, set negative here for fp32 safety).
+  (2) All Linear kernels use the paper's Xavier-uniform init, gain 2^{-2.5}, with zero
+      biases (App. D.5). The one exception: the decay bias δ starts negative (−4), not
+      the paper's value, to keep early decay mild for fp32 stability (App. D.1).
 """
 
 from typing import NamedTuple
@@ -42,6 +43,11 @@ from gated_deltanet_2.core import (
 )
 
 F32 = jnp.float32
+
+# App. D.5: Xavier-uniform init with gain 2^{-2.5} (variance_scaling scale = gain² =
+# 2^{-5}), replacing Flax NNX's default Linear kernel init. Biases stay at zero (the
+# NNX default) — except the decay bias δ, set negative in __init__ for fp32 safety.
+_XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
 
 
 # --------------------------------------------------------------------------- #
@@ -88,8 +94,12 @@ class LowRankLinear(nnx.Module):
         use_bias: bool = False,
         rngs: nnx.Rngs,
     ):
-        self.down = nnx.Linear(in_features, rank, use_bias=False, rngs=rngs)
-        self.up = nnx.Linear(rank, out_features, use_bias=use_bias, rngs=rngs)
+        self.down = nnx.Linear(
+            in_features, rank, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+        )
+        self.up = nnx.Linear(
+            rank, out_features, use_bias=use_bias, kernel_init=_XAVIER, rngs=rngs
+        )
 
     def __call__(self, x):
         return self.up(self.down(x))
@@ -157,7 +167,9 @@ class ShortConv(nnx.Module):
         self.weight = nnx.Param(w)
         self.bias = nnx.Param(jnp.zeros((channels,)))
 
-    def _apply(self, x, conv_state):
+    def _apply(
+        self, x: jax.Array, conv_state: jax.Array | None
+    ) -> tuple[jax.Array, jax.Array]:
         """Shared conv core. `conv_state` is the previous (kernel_size-1) inputs used
         as left context, or None on the full/training path (pad with zeros == the
         causal left-pad). Returns (y: [B, L, C], new_state: [B, kernel_size-1, C])."""
@@ -219,14 +231,20 @@ class GatedDeltaNet2(nnx.Module):
         v_proj_dim = self.Hv * self.dv  # v, w live on the value-head axis
 
         # Linear projections feeding the SiLU/conv paths (Sec. 3.5; Fig. 1 'Linear' boxes).
-        self.q_proj = nnx.Linear(d_model, k_proj_dim, use_bias=False, rngs=rngs)
-        self.k_proj = nnx.Linear(d_model, k_proj_dim, use_bias=False, rngs=rngs)
-        self.v_proj = nnx.Linear(d_model, v_proj_dim, use_bias=False, rngs=rngs)
+        self.q_proj = nnx.Linear(
+            d_model, k_proj_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+        )
+        self.k_proj = nnx.Linear(
+            d_model, k_proj_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+        )
+        self.v_proj = nnx.Linear(
+            d_model, v_proj_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+        )
         self.b_proj = nnx.Linear(
-            d_model, k_proj_dim, use_bias=True, rngs=rngs
+            d_model, k_proj_dim, use_bias=True, kernel_init=_XAVIER, rngs=rngs
         )  # Proj_b, Eq. 85: b = σ(Proj_b x)
         self.w_proj = nnx.Linear(
-            d_model, v_proj_dim, use_bias=True, rngs=rngs
+            d_model, v_proj_dim, use_bias=True, kernel_init=_XAVIER, rngs=rngs
         )  # Proj_w, Eq. 85: w = σ(Proj_w x)
         self.f_proj = LowRankLinear(
             d_model, self.dk, k_proj_dim, use_bias=True, rngs=rngs
@@ -257,10 +275,10 @@ class GatedDeltaNet2(nnx.Module):
             rngs=rngs,
         )
         self.o_proj = nnx.Linear(
-            v_proj_dim, d_model, use_bias=False, rngs=rngs
+            v_proj_dim, d_model, use_bias=False, kernel_init=_XAVIER, rngs=rngs
         )  # back to d_model
-        # NOTE (deviation 2): App. D.5 specifies Xavier-uniform init, gain 2^{-2.5}, zero biases;
-        # this module uses Flax NNX default initializers instead.
+        # App. D.5: every Linear kernel above uses Xavier-uniform init, gain 2^{-2.5}
+        # (_XAVIER); biases are zero except the decay bias δ (-4, for fp32 safety).
 
     def _split_k(self, x: jax.Array, B: int, L: int) -> jax.Array:
         # Head reshaping for key-side tensors (App. C.1: "followed by head reshaping").
@@ -349,7 +367,7 @@ class GatedDeltaNet2(nnx.Module):
 
     def __call__(
         self, x: jax.Array, initial_state: jax.Array | None = None
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> jax.Array:
         """Full-sequence (training) forward via the CHUNKWISE parallel core.
         x: [B, L, d_model]. Returns (out: [B, L, d_model], final_state: [B,Hv,dk,dv])."""
         B, L, _ = x.shape
@@ -357,10 +375,10 @@ class GatedDeltaNet2(nnx.Module):
         if initial_state is None:
             initial_state = jnp.zeros((B, self.Hv, self.dk, self.dv), jnp.float32)
         # Gated Delta Rule-2 chunkwise core (Eq. 10); forms cumsum γ internally (Eq. 30).
-        o, final_state = chunkwise_gated_delta_rule_2(
+        o, _final_state = chunkwise_gated_delta_rule_2(
             q, k, v, g, b, w, initial_state, chunk_size=self.chunk_size
         )
-        return self._output(o, x), final_state
+        return self._output(o, x)
 
     # ----------------------------------------------------------------------- #
     #  Streaming / inference.  Same math, but via the RECURRENT core, which works
