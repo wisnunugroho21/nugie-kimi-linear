@@ -152,7 +152,7 @@ class DecoderLayer(nnx.Module):
         # Pre-norm before the channel mixer.
         self.norm2 = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
 
-        # Channel mixer: MoE (faithful) or dense SwiGLU (minimal).
+        # Channel mixer: MoE
         self.channel_mixer = GroupedGemmMoE(
             d_model=cfg.d_model,
             d_ff=cfg.moe_d_ff,

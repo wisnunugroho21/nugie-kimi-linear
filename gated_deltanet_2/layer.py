@@ -77,7 +77,8 @@ class RMSNorm(nnx.Module):
 
     def __call__(self, x):
         xf = x.astype(F32)
-        rms = jax.lax.rsqrt(jnp.mean(xf * xf, axis=-1, keepdims=True) + self.eps)
+        mean = jnp.mean(xf * xf, axis=-1, keepdims=True)
+        rms = jax.lax.rsqrt(mean + self.eps)
         return (xf * rms).astype(x.dtype) * self.weight.value
 
 
@@ -133,10 +134,7 @@ class GatedRMSNorm(nnx.Module):
         eps: float = 1e-5,
         rngs: nnx.Rngs,
     ):
-        self.eps = eps
-        self.head_dim = head_dim  # dv, the axis RMSNorm normalizes over (head-wise)
-        self.inner_dim = inner_dim  # Hv * dv, the full token-mixer output width
-        self.weight = nnx.Param(jnp.ones((head_dim,)))
+        self.norm = RMSNorm(head_dim, eps=eps, rngs=rngs)
         self.gate = LowRankLinear(
             d_model, gate_rank, inner_dim, use_bias=False, rngs=rngs
         )
@@ -144,10 +142,12 @@ class GatedRMSNorm(nnx.Module):
     def __call__(self, O_heads, x):
         """O_heads: [B, L, Hv, dv]   x: [B, L, d_model]  ->  [B, L, Hv*dv]."""
         B, L, Hv, dv = O_heads.shape
-        o = O_heads.astype(F32)
-        rms = jax.lax.rsqrt(jnp.mean(o * o, axis=-1, keepdims=True) + self.eps)
-        o = o * rms * self.weight.value  # head-wise RMSNorm
-        g = jax.nn.sigmoid(self.gate(x).astype(F32))  # low-rank SIGMOID gate
+
+        o = O_heads.astype(F32)  # [B,L,Hv,dv] -> fp32 for RMSNorm
+        o = self.norm(o) # head-wise RMSNorm
+
+        g = self.gate(x).astype(F32)  # low-rank gate
+        g = jax.nn.sigmoid(g)  # low-rank SIGMOID gate
         g = g.reshape(B, L, Hv, dv)
         return (o * g).reshape(B, L, Hv * dv)
 
@@ -157,15 +157,25 @@ class ShortConv(nnx.Module):
 
     The paper says only "short causal convolution"; the kernel width (default 4)
     is an implementation choice, as in the Mamba/GatedDeltaNet lineage.
+
+    nnx.Conv is channels-last ([B, L, C]) and owns the kernel+bias, so the manual
+    NCW transposes and the raw conv call disappear. Padding is fixed at construction,
+    so we run the conv in 'VALID' mode and keep the causal left-context / streaming
+    state ourselves (state = the trailing kernel_size-1 inputs).
     """
 
     def __init__(self, channels: int, kernel_size: int = 4, *, rngs: nnx.Rngs):
         self.channels = channels
         self.kernel_size = kernel_size
-        key = rngs.params()
-        w = jax.random.normal(key, (channels, 1, kernel_size)) * (kernel_size**-0.5)
-        self.weight = nnx.Param(w)
-        self.bias = nnx.Param(jnp.zeros((channels,)))
+        self.conv = nnx.Conv(
+            in_features=channels,
+            out_features=channels,
+            kernel_size=(kernel_size,),
+            feature_group_count=channels,  # depthwise: one filter per channel
+            padding="VALID",  # left context supplied manually below
+            use_bias=True,
+            rngs=rngs,
+        )
 
     def _apply(
         self, x: jax.Array, conv_state: jax.Array | None
@@ -175,27 +185,19 @@ class ShortConv(nnx.Module):
         causal left-pad). Returns (y: [B, L, C], new_state: [B, kernel_size-1, C])."""
         B, L, C = x.shape
         kc = self.kernel_size - 1
+
         left = jnp.zeros((B, kc, C), x.dtype) if conv_state is None else conv_state
-        xc = jnp.concatenate([left, x], axis=1)  # [B, kc+L, C]  prepend left context
-        new_state = xc[
-            :, xc.shape[1] - kc :, :
-        ]  # last kc inputs -> next step's context
-        xt = jnp.transpose(xc, (0, 2, 1))  # [B, C, kc+L]
-        y = jax.lax.conv_general_dilated(
-            xt,
-            self.weight.value,
-            window_strides=(1,),
-            padding="VALID",  # out length (kc+L)-(kc+1)+1 = L; output t sees inputs t-kc..t
-            feature_group_count=self.channels,  # depthwise: one filter per channel
-            dimension_numbers=("NCW", "OIW", "NCW"),
-        )
-        y = y + self.bias.value[None, :, None]
-        return jnp.transpose(y, (0, 2, 1)), new_state  # [B, L, C]
+        xc = jnp.concatenate([left, x], axis=1)  # [B, kc+L, C]
+        new_state = xc[:, xc.shape[1] - kc :, :]  # last kc inputs -> next context
 
-    def __call__(self, x):  # full-sequence (training) path; left context = zeros
-        return self._apply(x, None)[0]
+        y = self.conv(xc)  # VALID: (kc+L)-(kc+1)+1 = L
+        return y, new_state  # [B, L, C]
 
-    def step(self, x, conv_state):  # streaming path; carry the left context in/out
+    def __call__(self, x: jax.Array) -> jax.Array:  # full-sequence (training) path; left context = zeros
+        y, _ = self._apply(x, conv_state=None)
+        return y
+
+    def step(self, x: jax.Array, conv_state: jax.Array) -> tuple[jax.Array, jax.Array]:  # streaming path; carry the left context in/out
         return self._apply(x, conv_state)
 
 
@@ -261,6 +263,7 @@ class GatedDeltaNet2(nnx.Module):
         self.A_log = nnx.Param(
             jnp.zeros((self.H, self.dk))
         )  # 'a' in -exp(a)·softplus(·)
+
         # App. C.1: bias δ is stored per key channel -> shape [H·d_k]. Eq. 86 adds it pre-softplus.
         #   Init negative (not the paper's value) so per-token decay starts mild (α≈1),
         #   keeping cumulative decay / γ^{-1} in a safe fp32 range (cf. App. D.1).
@@ -331,20 +334,22 @@ class GatedDeltaNet2(nnx.Module):
 
         # Log-decay branch, computed in fp32 outside the kernel (Eq. 12 / 86; App. C.1 / D.1).
         #   g_t = -exp(a) ⊙ softplus(Proj_f(x_t) + δ),  then α_t = exp(g_t) inside the core.
-        f = self.f_proj(x).astype(jnp.float32) + self.dt_bias.value.astype(
-            jnp.float32
-        )  # Proj_f(x)+δ
+        f_p = self.f_proj(x).astype(jnp.float32) # [B,L,H*dk]  Proj_f(x) in Eq. 86
+        d_t = self.dt_bias.value.astype(jnp.float32) # [H*dk]  decay bias δ, Eq. 86
+        a_l = self.A_log.value.astype(jnp.float32)  # [H, d_k]
+
+        f = f_p + d_t  # Proj_f(x)+δ
         f = self._split_k(f, B, L)
-        a = jnp.exp(self.A_log.value.astype(jnp.float32))[
-            None, :, None, :
-        ]  # exp(a); [1,H,1,dk]
+        a = jnp.exp(a_l)[None, :, None, :]  # exp(a); [1,H,1,dk]
         g = -a * jax.nn.softplus(f)  # [B,H,L,dk] ≤ 0  (Eq. 86)
 
         # Channel-wise gates (Eq. 11 / 85).
         b = jax.nn.sigmoid(self.b_proj(x))  # b = σ(Proj_b x) ∈ [0,1]^{d_k}
         b = self._split_k(b, B, L)
+
         if self.expanded_erase:
             b = 2.0 * b  # neg-eigenvalue variant: scale ONLY b to [0,2] (Sec. 3.1)
+
         w = jax.nn.sigmoid(self.w_proj(x))  # w = σ(Proj_w x) ∈ [0,1]^{d_v}
         w = self._split_v(w, B, L)
 
@@ -363,19 +368,20 @@ class GatedDeltaNet2(nnx.Module):
         """Gated RMSNorm + output projection (Sec. 3.5 / App. D.5). o: [B,Hv,L,dv]."""
         o = o.transpose(0, 2, 1, 3)  # [B,Hv,L,dv] -> [B,L,Hv,dv]
         o = self.o_norm(o, x)  # low-rank sigmoid gate computed inside, from x
-        return self.o_proj(o.astype(x.dtype))  # project back to d_model
+        o = o.astype(x.dtype)
+        return self.o_proj(o)  # project back to d_model
 
     def __call__(
         self, x: jax.Array, initial_state: jax.Array | None = None
     ) -> jax.Array:
         """Full-sequence (training) forward via the CHUNKWISE parallel core.
         x: [B, L, d_model]. Returns (out: [B, L, d_model], final_state: [B,Hv,dk,dv])."""
-        B, L, _ = x.shape
+        B, _, _ = x.shape
         q, k, v, g, b, w, _ = self._project(x, conv_states=None)
         if initial_state is None:
             initial_state = jnp.zeros((B, self.Hv, self.dk, self.dv), jnp.float32)
         # Gated Delta Rule-2 chunkwise core (Eq. 10); forms cumsum γ internally (Eq. 30).
-        o, _final_state = chunkwise_gated_delta_rule_2(
+        o, _ = chunkwise_gated_delta_rule_2(
             q, k, v, g, b, w, initial_state, chunk_size=self.chunk_size
         )
         return self._output(o, x)
@@ -405,9 +411,14 @@ class GatedDeltaNet2(nnx.Module):
 
     def step(self, x: jax.Array, cache: GDN2Cache) -> tuple[jax.Array, GDN2Cache]:
         """Streaming forward. x: [B, L, d_model] (L>=1). Returns (out, new_cache)."""
-        q, k, v, g, b, w, (qcs, kcs, vcs) = self._project(
+        q, k, v, g, b, w, new_conv = self._project(
             x, conv_states=(cache.q_conv, cache.k_conv, cache.v_conv)
         )
+        # We passed real conv_states, so _project always returns updated ones here
+        # (it only returns None on the full-sequence/training path) — assert narrows
+        # the tuple|None type for the checker and documents the invariant.
+        assert new_conv is not None
+        qcs, kcs, vcs = new_conv
         # Recurrent core: token-by-token, threading S_in -> S_out (Eq. 9 / 29).
         o, new_state = recurrent_gated_delta_rule_2(
             q, k, v, g, b, w, cache.recurrent_state
