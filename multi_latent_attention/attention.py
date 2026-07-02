@@ -173,7 +173,9 @@ class GroupedQueryLatentAttention(nnx.Module):
     #  and per-token decode (L = 1) alike.
     # ----------------------------------------------------------------------- #
     def init_cache(self, batch_size: int, max_len: int, dtype=jnp.float32) -> MLACache:
-        """Empty cache: a zeroed latent buffer of capacity `max_len`, position 0."""
+        """Initialize the streaming KV cache for a given batch size and max length.
+        The cache is a preallocated buffer of shape [B, max_len, Hkv*Dh] and a position counter. 
+        The buffer is filled with zeros initially."""
         d_kv = self.num_kv_heads * self.head_dim
         return MLACache(
             l_kv=jnp.zeros((batch_size, max_len, d_kv), dtype),
@@ -181,9 +183,11 @@ class GroupedQueryLatentAttention(nnx.Module):
         )
 
     def step(self, x: jax.Array, cache: MLACache) -> tuple[jax.Array, MLACache]:
-        """Streaming attention. x: [B, L, embed_dim] (L>=1). Returns (out, new_cache)."""
+        """Process a new chunk of input x, updating the cache and returning the output.
+        x: [B, L, embed_dim]  cache: MLACache with l_kv: [B, max_len, Hkv*Dh], pos: scalar int32"""
         B, L, _ = x.shape
         max_len = cache.l_kv.shape[1]
+        new_pos = cache.pos + L
 
         # Queries for the new positions (already in the compressed K space via W_UK).
         q_heads = (
@@ -195,8 +199,8 @@ class GroupedQueryLatentAttention(nnx.Module):
         l_kv = jax.lax.dynamic_update_slice(
             cache.l_kv, l_new.astype(cache.l_kv.dtype), (0, cache.pos, 0)
         )
-        new_pos = cache.pos + L
 
+        # --- Shared KV latent (serves as both keys and values) ---
         l_kv_heads = l_kv.reshape(
             B, max_len, self.num_kv_heads, self.head_dim
         ).swapaxes(1, 2)  # (B, Hkv, max_len, Dh)
@@ -215,9 +219,14 @@ class GroupedQueryLatentAttention(nnx.Module):
         mask = k_pos[None, :] <= q_pos[:, None]  # (L, max_len)
         logits = jnp.where(mask[None, None], logits, -jnp.inf)
 
+        # Softmax over the key axis -> per-query attention distribution.
         a = jax.nn.softmax(logits, axis=-1)
+
+        # Weighted sum of value-latents: the same latent serves as both K and V.
         weighted = jnp.einsum("bhqk, bhkd -> bhqd", a, l_kv_rep)  # (B, Hq, L, Dh)
         weighted = weighted.swapaxes(1, 2).reshape(
             B, L, self.num_q_heads * self.head_dim
         )
-        return self.w_uv_o(weighted), MLACache(l_kv, new_pos)
+
+        output = self.w_uv_o(weighted)  # (B, L, embed_dim)
+        return output, MLACache(l_kv, new_pos)

@@ -53,8 +53,8 @@ import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 # Reuse the building blocks already implemented and verified in this repo.
-from gated_deltanet_2.layer import GatedDeltaNet2, RMSNorm
-from multi_latent_attention.attention import GroupedQueryLatentAttention
+from gated_deltanet_2.layer import GDN2Cache, GatedDeltaNet2, RMSNorm
+from multi_latent_attention.attention import GroupedQueryLatentAttention, MLACache
 from multi_latent_attention.moe import GroupedGemmMoE
 
 # App. D.5: Xavier-uniform init with gain 2^{-2.5} (variance_scaling scale = gain² =
@@ -181,17 +181,28 @@ class DecoderLayer(nnx.Module):
         """Per-layer streaming cache: a GDN2Cache (linear layer) or MLACache (MLA)."""
         return self.token_mixer.init_cache(batch_size, max_len, dtype)
 
-    def step(self, x: jax.Array, cache):
+    def step(self, x: jax.Array, cache: GDN2Cache | MLACache) -> tuple[jax.Array, GDN2Cache | MLACache]:
         """Streaming forward for one block. x: [B, L, d_model] -> (x, new_cache).
         Only the token mixer is stateful; the channel mixer (MoE) is position-wise,
         so it needs no cache."""
         h = self.norm1(x)
-        h, new_cache = self.token_mixer.step(
-            h, cache
-        )  # GDN-2 and MLA both expose .step
+
+        if isinstance(cache, GDN2Cache) and isinstance(self.token_mixer, GatedDeltaNet2):
+            # GDN-2: fixed-size recurrent state (O(1) per token).
+            h, new_cache = self.token_mixer.step(h, cache)
+        elif isinstance(cache, MLACache) and isinstance(self.token_mixer, GroupedQueryLatentAttention):
+            # MLA: growing latent cache (O(context) per token).
+            h, new_cache = self.token_mixer.step(
+                h, cache
+            )
+        else:
+            raise ValueError(
+                f"Cache type {type(cache)} does not match token mixer {type(self.token_mixer)}"
+            )
+        
         x = x + h
         y = self.norm2(x)
-        m, _aux = self.channel_mixer(y)
+        m, _ = self.channel_mixer(y)
         x = x + m
         return x, new_cache
 
@@ -208,11 +219,13 @@ class KimiLinear(nnx.Module):
         self.embed = nnx.Embed(
             cfg.vocab_size, cfg.d_model, embedding_init=_XAVIER, rngs=rngs
         )
+
         # Stack of decoder blocks. NOTE: in Flax NNX a plain Python list of submodules
         # is not tracked as state — it must be wrapped in nnx.List(...).
         self.layers = nnx.List(
             [DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.n_layers)]
         )
+
         # Final pre-head norm + untied LM head (Moonlight/DeepSeek do not tie weights;
         # to tie, drop lm_head and use `x @ self.embed.embedding.value.T` instead).
         self.norm_f = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
@@ -229,12 +242,12 @@ class KimiLinear(nnx.Module):
         The training loop uses aux_loss (added to the CE loss) and group_sizes (to nudge
         each MoE layer's router bias); eval/inference paths simply ignore it.
         """
-        x = self.embed(input_ids)  # [B, L, d_model]
-
         aux_loss: ArrayLike = 0.0
         group_sizes: list[
             ArrayLike
         ] = []  # one [E] vector per MoE layer, in layer order
+
+        x = self.embed(input_ids)  # [B, L, d_model]
         for layer in self.layers:
             x, aux = layer(x)
 
@@ -262,11 +275,13 @@ class KimiLinear(nnx.Module):
     def step(self, input_ids: jax.Array, caches: list) -> tuple[jax.Array, list]:
         """One streaming step. input_ids: int[B, L] (L = prompt length on prefill, or
         1 per decoded token). Returns (logits[B, L, vocab], new_caches)."""
-        x = self.embed(input_ids)
         new_caches = []
+
+        x = self.embed(input_ids)
         for layer, cache in zip(self.layers, caches):
             x, new_cache = layer.step(x, cache)
             new_caches.append(new_cache)
+
         x = self.norm_f(x)
         return self.lm_head(x), new_caches
 
@@ -282,14 +297,17 @@ class KimiLinear(nnx.Module):
         growing latent cache. (Wrap `step` in nnx.jit for a fast decode loop.)"""
         B, P = prompt_ids.shape
         max_len = max_len or (P + max_new_tokens)
+
         caches = self.init_cache(B, max_len)
         logits, caches = self.step(prompt_ids, caches)  # prefill the prompt
         next_tok = jnp.argmax(logits[:, -1:], axis=-1)  # [B, 1] greedy
         outs = [next_tok]
+
         for _ in range(max_new_tokens - 1):
             logits, caches = self.step(next_tok, caches)  # decode one token
             next_tok = jnp.argmax(logits[:, -1:], axis=-1)
             outs.append(next_tok)
+            
         return jnp.concatenate(outs, axis=1)  # [B, max_new_tokens]
 
 

@@ -103,21 +103,35 @@ class GroupedGemmMoE(nnx.Module):
 
     # ----------------------------------------------------------------------- #
     def _route(self, x_flat: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """x_flat: [T, d] -> (top_idx [T,k], gate [T,k], scores [T,E])."""
+        """Route tokens to experts, returning top-k indices, gate weights, and
+        sigmoid affinities (for aux-loss-free load balancing). The selection bias is
+        applied only to the SELECTION, not the gate weights, so that the gradient flows 
+        through the true sigmoid affinities. The bias is updated outside the gradient to
+        nudge the selection toward uniform load. The gate weights are taken from the true scores, 
+        not the selection, so that the gradient flows through the sigmoid affinities. 
+        The selection bias is only used to choose the top-k experts."""
         logits = self.router(x_flat).astype(F32)
         scores = jax.nn.sigmoid(logits)  # affinities [T,E]
 
+        # The selection bias is applied only to the SELECTION, not the gate weights, so
+        # that the gradient flows through the true sigmoid affinities. The bias is
+        # updated outside the gradient to nudge the selection toward uniform load.
         sel = scores + self.router_bias if self.bias_balancing else scores
         sel = jax.lax.stop_gradient(sel) if self.bias_balancing else sel
         _, top_idx = jax.lax.top_k(sel, self.top_k)  # selection [T,k]
 
+        # Gate weights are taken from the true scores, not the selection, so that
+        # the gradient flows through the sigmoid affinities. The selection bias is
+        # only used to choose the top-k experts, not to scale their weights.
         gate = jnp.take_along_axis(scores, top_idx, axis=-1)  # gate from true scores
         if self.norm_topk:
             gate = gate / (gate.sum(-1, keepdims=True) + 1e-9)
         gate = gate * self.routed_scale
+
         return top_idx, gate, scores
 
     def _shared(self, x_flat: jax.Array) -> jax.Array:
+        """Shared expert(s) as a single wider SwiGLU (always applied to every token)."""
         a = jax.nn.silu(x_flat @ self.ws_gate) * (x_flat @ self.ws_up)
         return a @ self.ws_down
 
