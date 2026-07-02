@@ -220,9 +220,7 @@ class KimiLinear(nnx.Module):
             cfg.d_model, cfg.vocab_size, use_bias=False, kernel_init=_XAVIER, rngs=rngs
         )
 
-    def __call__(
-        self, input_ids: jax.Array
-    ) -> tuple[jax.Array, dict[str, ArrayLike]]:
+    def __call__(self, input_ids: jax.Array) -> tuple[jax.Array, dict[str, ArrayLike]]:
         """input_ids: int[B, L] -> (logits[B, L, vocab], aux).
 
         aux is ALWAYS returned (callers that don't need it just unpack `logits, _ =`):

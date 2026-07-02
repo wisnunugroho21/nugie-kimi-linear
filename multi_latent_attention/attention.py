@@ -172,9 +172,7 @@ class GroupedQueryLatentAttention(nnx.Module):
     #  new positions are written into it.  Use it for prefill (L = prompt length)
     #  and per-token decode (L = 1) alike.
     # ----------------------------------------------------------------------- #
-    def init_cache(
-        self, batch_size: int, max_len: int, dtype=jnp.float32
-    ) -> MLACache:
+    def init_cache(self, batch_size: int, max_len: int, dtype=jnp.float32) -> MLACache:
         """Empty cache: a zeroed latent buffer of capacity `max_len`, position 0."""
         d_kv = self.num_kv_heads * self.head_dim
         return MLACache(
@@ -189,9 +187,7 @@ class GroupedQueryLatentAttention(nnx.Module):
 
         # Queries for the new positions (already in the compressed K space via W_UK).
         q_heads = (
-            self.w_q_uk(x)
-            .reshape(B, L, self.num_q_heads, self.head_dim)
-            .swapaxes(1, 2)
+            self.w_q_uk(x).reshape(B, L, self.num_q_heads, self.head_dim).swapaxes(1, 2)
         )  # (B, Hq, L, Dh)
 
         # New latents -> write them into the cache buffer at the current position.
@@ -207,9 +203,9 @@ class GroupedQueryLatentAttention(nnx.Module):
         l_kv_rep = l_kv_heads.repeat(self.group_size, axis=1)  # (B, Hq, max_len, Dh)
 
         # Scores: the L new queries attend over all max_len cached slots.
-        logits = jnp.einsum(
-            "bhqd, bhkd -> bhqk", q_heads, l_kv_rep
-        ) / jnp.sqrt(self.head_dim)
+        logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep) / jnp.sqrt(
+            self.head_dim
+        )
 
         # Causal mask offset by the cache position: query i sits at absolute position
         # pos+i and may attend to slot j iff j <= pos+i.  This also masks the not-yet-

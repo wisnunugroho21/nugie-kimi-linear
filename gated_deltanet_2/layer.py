@@ -145,7 +145,7 @@ class GatedRMSNorm(nnx.Module):
         B, L, Hv, dv = O_heads.shape
 
         o = O_heads.astype(F32)  # [B,L,Hv,dv] -> fp32 for RMSNorm
-        o = self.norm(o) # head-wise RMSNorm
+        o = self.norm(o)  # head-wise RMSNorm
 
         g = self.gate(x).astype(F32)  # low-rank gate
         g = jax.nn.sigmoid(g)  # low-rank SIGMOID gate
@@ -194,11 +194,15 @@ class ShortConv(nnx.Module):
         y = self.conv(xc)  # VALID: (kc+L)-(kc+1)+1 = L
         return y, new_state  # [B, L, C]
 
-    def __call__(self, x: jax.Array) -> jax.Array:  # full-sequence (training) path; left context = zeros
+    def __call__(
+        self, x: jax.Array
+    ) -> jax.Array:  # full-sequence (training) path; left context = zeros
         y, _ = self._apply(x, conv_state=None)
         return y
 
-    def step(self, x: jax.Array, conv_state: jax.Array) -> tuple[jax.Array, jax.Array]:  # streaming path; carry the left context in/out
+    def step(
+        self, x: jax.Array, conv_state: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:  # streaming path; carry the left context in/out
         return self._apply(x, conv_state)
 
 
@@ -340,8 +344,8 @@ class GatedDeltaNet2(nnx.Module):
 
         # Log-decay branch, computed in fp32 outside the kernel (Eq. 12 / 86; App. C.1 / D.1).
         #   g_t = -exp(a) ⊙ softplus(Proj_f(x_t) + δ),  then α_t = exp(g_t) inside the core.
-        f_p = self.f_proj(x).astype(jnp.float32) # [B,L,H*dk]  Proj_f(x) in Eq. 86
-        d_t = self.dt_bias.value.astype(jnp.float32) # [H*dk]  decay bias δ, Eq. 86
+        f_p = self.f_proj(x).astype(jnp.float32)  # [B,L,H*dk]  Proj_f(x) in Eq. 86
+        d_t = self.dt_bias.value.astype(jnp.float32)  # [H*dk]  decay bias δ, Eq. 86
         a_l = self.A_log.value.astype(jnp.float32)  # [H, d_k]
 
         f = f_p + d_t  # Proj_f(x)+δ
@@ -373,7 +377,9 @@ class GatedDeltaNet2(nnx.Module):
     def _output(self, o: jax.Array, x: jax.Array) -> jax.Array:
         """Gated RMSNorm + output projection (Sec. 3.5 / App. D.5). o: [B,Hv,L,dv]."""
         o = o.swapaxes(1, 2)  # [B,Hv,L,dv] -> [B,L,Hv,dv]
-        o = self.o_norm(o, x).astype(x.dtype)  # low-rank sigmoid gate computed inside, from x
+        o = self.o_norm(o, x).astype(
+            x.dtype
+        )  # low-rank sigmoid gate computed inside, from x
         return self.o_proj(o)  # project back to d_model
 
     def __call__(
