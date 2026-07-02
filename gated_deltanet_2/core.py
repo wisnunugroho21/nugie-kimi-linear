@@ -168,6 +168,7 @@ def _recurrent_single(
     def step(S, inp):
         qt, kt, at, et, zt = inp
 
+        # Reshape inputs to column vectors for matrix multiplication
         qt = qt[:, None]
         kt = kt[:, None]
         at = at[:, None]

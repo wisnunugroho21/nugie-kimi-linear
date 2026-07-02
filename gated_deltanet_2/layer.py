@@ -79,6 +79,7 @@ class RMSNorm(nnx.Module):
         xf = x.astype(F32)
         mean = jnp.mean(xf * xf, axis=-1, keepdims=True)
         rms = jax.lax.rsqrt(mean + self.eps)
+
         return (xf * rms).astype(x.dtype) * self.weight.value
 
 
@@ -150,6 +151,7 @@ class GatedRMSNorm(nnx.Module):
         g = self.gate(x).astype(F32)  # low-rank gate
         g = jax.nn.sigmoid(g)  # low-rank SIGMOID gate
         g = g.reshape(B, L, Hv, dv)
+
         return (o * g).reshape(B, L, Hv * dv)
 
 
@@ -346,7 +348,9 @@ class GatedDeltaNet2(nnx.Module):
         #   g_t = -exp(a) ⊙ softplus(Proj_f(x_t) + δ),  then α_t = exp(g_t) inside the core.
         f_p = self.f_proj(x).astype(jnp.float32)  # [B,L,H*dk]  Proj_f(x) in Eq. 86
         d_t = self.dt_bias.value.astype(jnp.float32)  # [H*dk]  decay bias δ, Eq. 86
-        a_l = self.A_log.value.astype(jnp.float32)  # [H, d_k]
+        a_l = self.A_log.value.astype(
+            jnp.float32
+        )  # [H, d_k]  log-decay matrix A, Eq. 86
 
         f = f_p + d_t  # Proj_f(x)+δ
         f = self._split_k(f, B, L)
@@ -380,6 +384,7 @@ class GatedDeltaNet2(nnx.Module):
         o = self.o_norm(o, x).astype(
             x.dtype
         )  # low-rank sigmoid gate computed inside, from x
+
         return self.o_proj(o)  # project back to d_model
 
     def __call__(
@@ -402,6 +407,7 @@ class GatedDeltaNet2(nnx.Module):
         o, _ = chunkwise_gated_delta_rule_2(
             q, k, v, g, b, w, initial_state, chunk_size=self.chunk_size
         )
+
         return self._output(o, x)
 
     # ----------------------------------------------------------------------- #
@@ -442,4 +448,5 @@ class GatedDeltaNet2(nnx.Module):
         o, new_state = recurrent_gated_delta_rule_2(
             q, k, v, g, b, w, cache.recurrent_state
         )
+
         return self._output(o, x), GDN2Cache(new_state, qcs, kcs, vcs)
