@@ -48,7 +48,6 @@ class GroupedQueryLatentAttention(nnx.Module):
         num_q_heads: int,
         num_kv_heads: int,
         head_dim: int,
-        dropout_rate: float,
         seq_length: int,
         rngs: nnx.Rngs,
     ):
@@ -73,10 +72,12 @@ class GroupedQueryLatentAttention(nnx.Module):
         self.w_q_uk = nnx.Linear(
             embed_dim, d_q, use_bias=False, kernel_init=_XAVIER, rngs=rngs
         )
+
         # W_DKV: x -> low-rank KV latent c_kv (one latent per KV head).
         self.w_dkv = nnx.Linear(
             embed_dim, d_kv, use_bias=False, kernel_init=_XAVIER, rngs=rngs
         )
+
         # W_UV . W_O absorbed: value-latent -> up-projected, output-projected.
         self.w_uv_o = nnx.Linear(
             d_q, embed_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs

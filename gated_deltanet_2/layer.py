@@ -75,7 +75,7 @@ class RMSNorm(nnx.Module):
         self.eps = eps
         self.weight = nnx.Param(jnp.ones((dim,)))
 
-    def __call__(self, x):
+    def __call__(self, x: jax.Array) -> jax.Array:
         xf = x.astype(F32)
         mean = jnp.mean(xf * xf, axis=-1, keepdims=True)
         rms = jax.lax.rsqrt(mean + self.eps)
@@ -102,8 +102,9 @@ class LowRankLinear(nnx.Module):
             rank, out_features, use_bias=use_bias, kernel_init=_XAVIER, rngs=rngs
         )
 
-    def __call__(self, x):
-        return self.up(self.down(x))
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = self.down(x)
+        return self.up(x)
 
 
 class GatedRMSNorm(nnx.Module):
@@ -139,7 +140,7 @@ class GatedRMSNorm(nnx.Module):
             d_model, gate_rank, inner_dim, use_bias=False, rngs=rngs
         )
 
-    def __call__(self, O_heads, x):
+    def __call__(self, O_heads: jax.Array, x: jax.Array) -> jax.Array:
         """O_heads: [B, L, Hv, dv]   x: [B, L, d_model]  ->  [B, L, Hv*dv]."""
         B, L, Hv, dv = O_heads.shape
 
@@ -220,7 +221,9 @@ class GatedDeltaNet2(nnx.Module):
         self.d_model = d_model
         self.H = num_heads
         self.Hv = num_v_heads or num_heads
+
         assert self.Hv % self.H == 0, "num_v_heads must be a multiple of num_heads"
+
         self.group = self.Hv // self.H  # G, value-head group size (App. C.1)
         self.dk = head_k_dim
         self.dv = head_v_dim
@@ -277,19 +280,21 @@ class GatedDeltaNet2(nnx.Module):
             gate_rank=self.dv,
             rngs=rngs,
         )
+
         self.o_proj = nnx.Linear(
             v_proj_dim, d_model, use_bias=False, kernel_init=_XAVIER, rngs=rngs
         )  # back to d_model
+
         # App. D.5: every Linear kernel above uses Xavier-uniform init, gain 2^{-2.5}
         # (_XAVIER); biases are zero except the decay bias δ (-4, for fp32 safety).
 
     def _split_k(self, x: jax.Array, B: int, L: int) -> jax.Array:
         # Head reshaping for key-side tensors (App. C.1: "followed by head reshaping").
-        return x.reshape(B, L, self.H, self.dk).transpose(0, 2, 1, 3)  # [B,H,L,dk]
+        return x.reshape(B, L, self.H, self.dk).swapaxes(1, 2)  # [B,H,L,dk]
 
     def _split_v(self, x: jax.Array, B: int, L: int) -> jax.Array:
         # Head reshaping for value-side tensors.
-        return x.reshape(B, L, self.Hv, self.dv).transpose(0, 2, 1, 3)  # [B,Hv,L,dv]
+        return x.reshape(B, L, self.Hv, self.dv).swapaxes(1, 2)  # [B,Hv,L,dv]
 
     def _project(
         self, x: jax.Array, conv_states: tuple[jax.Array, jax.Array, jax.Array] | None
@@ -322,6 +327,7 @@ class GatedDeltaNet2(nnx.Module):
             k, kcs = self.k_conv.step(self.k_proj(x), kcs)
             v, vcs = self.v_conv.step(self.v_proj(x), vcs)
             new_conv = (qcs, kcs, vcs)
+
         q, k, v = jax.nn.silu(q), jax.nn.silu(k), jax.nn.silu(v)
 
         q = self._split_k(q, B, L)
@@ -366,9 +372,8 @@ class GatedDeltaNet2(nnx.Module):
 
     def _output(self, o: jax.Array, x: jax.Array) -> jax.Array:
         """Gated RMSNorm + output projection (Sec. 3.5 / App. D.5). o: [B,Hv,L,dv]."""
-        o = o.transpose(0, 2, 1, 3)  # [B,Hv,L,dv] -> [B,L,Hv,dv]
-        o = self.o_norm(o, x)  # low-rank sigmoid gate computed inside, from x
-        o = o.astype(x.dtype)
+        o = o.swapaxes(1, 2)  # [B,Hv,L,dv] -> [B,L,Hv,dv]
+        o = self.o_norm(o, x).astype(x.dtype)  # low-rank sigmoid gate computed inside, from x
         return self.o_proj(o)  # project back to d_model
 
     def __call__(
@@ -378,8 +383,10 @@ class GatedDeltaNet2(nnx.Module):
         x: [B, L, d_model]. Returns (out: [B, L, d_model], final_state: [B,Hv,dk,dv])."""
         B, _, _ = x.shape
         q, k, v, g, b, w, _ = self._project(x, conv_states=None)
+
         if initial_state is None:
             initial_state = jnp.zeros((B, self.Hv, self.dk, self.dv), jnp.float32)
+
         # Gated Delta Rule-2 chunkwise core (Eq. 10); forms cumsum γ internally (Eq. 30).
         o, _ = chunkwise_gated_delta_rule_2(
             q, k, v, g, b, w, initial_state, chunk_size=self.chunk_size
@@ -419,6 +426,7 @@ class GatedDeltaNet2(nnx.Module):
         # the tuple|None type for the checker and documents the invariant.
         assert new_conv is not None
         qcs, kcs, vcs = new_conv
+
         # Recurrent core: token-by-token, threading S_in -> S_out (Eq. 9 / 29).
         o, new_state = recurrent_gated_delta_rule_2(
             q, k, v, g, b, w, cache.recurrent_state
