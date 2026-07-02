@@ -28,9 +28,15 @@ chat output to be only vaguely English — the point is a correct, complete pipe
 from __future__ import annotations
 
 import os
+import sys
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+# Prompts/banners below use non-ASCII punctuation (em dashes). On Windows the console
+# defaults to cp1252; force UTF-8 so printing (and echoing user prompts) never crashes.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 import grain
 import jax

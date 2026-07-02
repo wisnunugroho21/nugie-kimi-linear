@@ -27,6 +27,7 @@ Run:  python train.py
 
 from __future__ import annotations
 
+import sys
 import tempfile
 
 import jax
@@ -34,6 +35,11 @@ import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
 from flax import nnx
+
+# Some diagnostic prints use non-ASCII math symbols (e.g. Δ). On Windows the console
+# defaults to cp1252, which cannot encode them; force UTF-8 so printing never crashes.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 from kimi_linear_gdn2 import KimiLinear, KimiLinearConfig, count_params
 from multi_latent_attention.moe import GroupedGemmMoE, update_router_bias
@@ -79,8 +85,8 @@ def train_step(model: KimiLinear, optimizer: nnx.Optimizer, batch, bias_lr: floa
     targets = batch[:, 1:]
 
     def loss_fn(model: KimiLinear):
-        # return_aux=True also gives the MoE load-balancing diagnostics.
-        full_logits, aux = model(batch, return_aux=True)
+        # The model always returns (logits, aux); aux carries the MoE diagnostics.
+        full_logits, aux = model(batch)
         logits = full_logits[:, :-1]  # drop the last position's prediction
         ce = cross_entropy(logits, targets)
         # Total training loss = CE + the (already alpha-scaled) MoE aux loss.

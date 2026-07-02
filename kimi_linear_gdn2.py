@@ -29,7 +29,7 @@ Kimi Linear — the 3:1 hybrid schedule, NoPE MLA, MoE FFN, pre-norm residual bl
 BLOCK STRUCTURE (standard pre-norm transformer; Fig. 2)
 -------------------------------------------------------
     x = x + TokenMixer(RMSNorm(x))     # TokenMixer = GDN-2 (linear) OR MLA (full)
-    x = x + ChannelMixer(RMSNorm(x))   # ChannelMixer = MoE (or a dense SwiGLU MLP)
+    x = x + ChannelMixer(RMSNorm(x))   # ChannelMixer = MoE
 
 MODEL = Embed -> [DecoderLayer] * n_layers -> RMSNorm -> LM head.
 
@@ -103,7 +103,6 @@ class KimiLinearConfig:
     moe_n_routed: int = 8  # number of routed experts E (paper: 256)
     moe_n_shared: int = 1  # always-on shared experts
     moe_top_k: int = 2  # experts activated per token (paper: 8)
-    mlp_d_ff: int = 768  # hidden width of the dense MLP fallback
 
     rms_eps: float = 1e-5
 
@@ -112,9 +111,9 @@ class KimiLinearConfig:
 #  One decoder block: pre-norm token mixer + pre-norm channel mixer, both residual.
 #
 #  The ONLY thing that varies across layers is the token mixer: GDN-2 (linear) on
-#  most layers, MLA (full attention) on the 3:1 schedule. The channel mixer (MoE or
-#  dense MLP) is the same kind on every layer — this matches Kimi Linear, where the
-#  hybrid is in the *attention*, not the FFN.
+#  most layers, MLA (full attention) on the 3:1 schedule. The channel mixer is a MoE
+#  on every layer — this matches Kimi Linear, where the hybrid is in the *attention*,
+#  not the FFN.
 # --------------------------------------------------------------------------- #
 class DecoderLayer(nnx.Module):
     def __init__(self, cfg: KimiLinearConfig, layer_idx: int, *, rngs: nnx.Rngs):
@@ -131,7 +130,6 @@ class DecoderLayer(nnx.Module):
                 num_q_heads=cfg.mla_num_q_heads,
                 num_kv_heads=cfg.mla_num_kv_heads,
                 head_dim=cfg.mla_head_dim,
-                dropout_rate=0.0,
                 seq_length=cfg.max_seq_len,
                 rngs=rngs,
             )
@@ -185,7 +183,7 @@ class DecoderLayer(nnx.Module):
 
     def step(self, x: jax.Array, cache):
         """Streaming forward for one block. x: [B, L, d_model] -> (x, new_cache).
-        Only the token mixer is stateful; the channel mixer (MoE/MLP) is position-wise,
+        Only the token mixer is stateful; the channel mixer (MoE) is position-wise,
         so it needs no cache."""
         h = self.norm1(x)
         h, new_cache = self.token_mixer.step(
@@ -223,12 +221,15 @@ class KimiLinear(nnx.Module):
         )
 
     def __call__(
-        self, input_ids: jax.Array, return_aux: bool = False
+        self, input_ids: jax.Array
     ) -> tuple[jax.Array, dict[str, ArrayLike]]:
-        """input_ids: int[B, L] -> logits[B, L, vocab]  (or (logits, aux) if return_aux).
+        """input_ids: int[B, L] -> (logits[B, L, vocab], aux).
 
-        aux = {"aux_loss": scalar summed over MoE layers,
-               "group_sizes": list of per-expert token counts, one entry per layer}.
+        aux is ALWAYS returned (callers that don't need it just unpack `logits, _ =`):
+            aux = {"aux_loss":   scalar, the MoE load-balancing loss summed over layers,
+                   "group_sizes": int[n_layers, E], per-expert token counts per layer}.
+        The training loop uses aux_loss (added to the CE loss) and group_sizes (to nudge
+        each MoE layer's router bias); eval/inference paths simply ignore it.
         """
         x = self.embed(input_ids)  # [B, L, d_model]
 

@@ -18,9 +18,17 @@ trust that the code matches the math in the papers.
      equivalent to scoring the whole sequence at once.
 """
 
+import sys
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
+
+# The diagnostic prints below use a few non-ASCII math symbols (e.g. Δ). On Windows
+# the console defaults to cp1252, which cannot encode them and raises
+# UnicodeEncodeError mid-print. Force UTF-8 output so the script runs everywhere.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 from gated_deltanet_2.core import (
     chunkwise_gated_delta_rule_2,
@@ -69,7 +77,7 @@ def check_model_forward():
     )
     model = KimiLinear(cfg, rngs=nnx.Rngs(0))
     ids = jax.random.randint(jax.random.PRNGKey(2), (2, 64), 0, cfg.vocab_size)
-    logits, aux = model(ids, return_aux=True)
+    logits, aux = model(ids)  # the model always returns (logits, aux)
     full = [i for i, l in enumerate(model.layers) if l.is_full_attn]
     print(f"[3] model forward                 | logits {tuple(logits.shape)} "
           f"finite={bool(jnp.all(jnp.isfinite(logits)))} | params {count_params(model):,}")

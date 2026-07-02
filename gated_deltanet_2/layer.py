@@ -380,7 +380,12 @@ class GatedDeltaNet2(nnx.Module):
         self, x: jax.Array, initial_state: jax.Array | None = None
     ) -> jax.Array:
         """Full-sequence (training) forward via the CHUNKWISE parallel core.
-        x: [B, L, d_model]. Returns (out: [B, L, d_model], final_state: [B,Hv,dk,dv])."""
+        x: [B, L, d_model] -> out: [B, L, d_model].
+
+        The core also produces the end-of-sequence recurrent state, but training only
+        needs the outputs, so it is discarded here (the streaming `step` below is what
+        threads the state across calls). `initial_state` lets a caller warm-start from a
+        prior state; it defaults to zeros."""
         B, _, _ = x.shape
         q, k, v, g, b, w, _ = self._project(x, conv_states=None)
 
