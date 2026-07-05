@@ -38,6 +38,17 @@ from jax import lax
 # math runs in fp32 (paper App. D.1/D.3/D.4)
 D_TYPE = jnp.float32
 
+# Numerical guard for the decay-normalized keys K̄ = γ^{-1}⊙K = exp(-G)⊙K (Eq.19/32).
+# g_t ≤ 0, so the within-chunk cumsum G is negative and exp(-G) grows; once the
+# trained decay is strong enough that -G exceeds ~88 anywhere in a chunk, exp(-G)
+# OVERFLOWS fp32 -> inf -> NaN (the classic "trains fine, then NaN" failure). We
+# floor G so exp(-G) ≤ exp(30) ≈ 1e13, far below the fp32 ceiling. A position past
+# this floor has decay weight exp(-30) ≈ 1e-13 — already fully erased — so flooring
+# is the correct limit, not an approximation that changes well-conditioned results.
+# Applied ONCE to G, so γ=exp(G), γ^{-1}=exp(-G), γ_C/γ, and Q_γ stay mutually
+# consistent (every telescoping ratio still uses the same clamped G).
+_LOG_DECAY_FLOOR = -30.0
+
 
 # --------------------------------------------------------------------------- #
 #  Single (batch, head) sequence — the actual algorithm.
@@ -53,7 +64,15 @@ def _chunkwise_single(
     S0: jax.Array,
     chunk_size: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """q,k,g,b: [L, dk]  v,w: [L, dv]  S0: [dk, dv]  ->  (O: [L, dv], S_final: [dk, dv])."""
+    """q,k,g,b: [L, dk]  v,w: [L, dv]  S0: [dk, dv]  ->  (O: [L, dv], S_final: [dk, dv]).
+
+    Structured for GPU throughput: everything that is chunk-LOCAL (Eqs. 18-22 and
+    the A_qk/K_tail factors of Eqs. 23-25 — cumsums, gate products, the triangular
+    solve, the WY auxiliaries) depends only on the chunk's own inputs, so it is
+    computed for ALL N chunks at once as batched [N, C, ·] ops. Only the parts
+    that read the running state S remain in the sequential cross-chunk scan, and
+    that scan body is just three small matmuls per chunk.
+    """
     L, dk = k.shape
     dv = v.shape[-1]
     C = chunk_size
@@ -68,73 +87,82 @@ def _chunkwise_single(
     eye = jnp.eye(C, dtype=D_TYPE)
     S0 = S0.astype(D_TYPE)
 
-    def chunk_step(S, inp):
-        # S is the raw chunk-entry state S_[n] (== S_0, NOT decay-normalized).
-        # The per-chunk cumsum below resets every step, which realizes both
-        # gamma_0 = 1 (Eq. 18/30) and the normalized init Ŝ_0 = S_[n] (Eq. 31 / A.1).
-        qc, kc, vc, gc, bc, wc = inp  # each [C, d*]
+    # ---- Chunk-local precompute: all N chunks in parallel ([N, C, d*]) --------
+    # The per-chunk cumsum (axis=1) resets at every chunk boundary, which realizes
+    # both gamma_0 = 1 (Eq. 18/30) and the normalized init Ŝ_0 = S_[n] (Eq. 31 / A.1).
 
-        # --- Cumulative decay -------------------------------------------------
-        # Eq. 18/30:  G_r = Σ_{i≤r} g_i (inclusive)
-        G = jnp.cumsum(gc, axis=0)
+    # --- Cumulative decay ---
+    # Eq. 18/30:  G_r = Σ_{i≤r} g_i (inclusive, within chunk)
+    G = jnp.cumsum(g, axis=1)
 
-        # Eq. 18/30:  γ_r = exp(G_r)
-        gamma = jnp.exp(G)
+    # Numerical guard (see _LOG_DECAY_FLOOR): floor G so exp(-G) in K̄ below
+    # cannot overflow fp32. Order-preserving, applied before every use of G.
+    G = jnp.maximum(G, _LOG_DECAY_FLOOR)
 
-        # γ_C, total chunk decay (last row); Eq. 40/41
-        gamma_C = gamma[-1]
+    # Eq. 18/30:  γ_r = exp(G_r)
+    gamma = jnp.exp(G)
 
-        # --- Decay normalization (removes Diag(α) from the recurrence) --------
-        # Eq. 19/32/33:  K̄ = γ^{-1} ⊙ K  (exp(-G) = 1/γ in log-space)
-        Kbar = kc * jnp.exp(-G)
+    # γ_C, total chunk decay (last row of each chunk); Eq. 40/41
+    gamma_C = gamma[:, -1]  # [N, dk]
 
-        # Eq. 20/33:     Ē = γ ⊙ (B ⊙ K);  bc*kc = e_r (Eq. 8), γ⊙ = ē_r (Eq. 19/32)
-        Ebar = gamma * (bc * kc)
+    # --- Decay normalization (removes Diag(α) from the recurrence) ---
+    # Eq. 19/32/33:  K̄ = γ^{-1} ⊙ K  (exp(-G) = 1/γ in log-space)
+    Kbar = k * jnp.exp(-G)
 
-        # Eq. 8, 20/33:  Z = W ⊙ V  (z_r = w_r ⊙ v_r)
-        Z = wc * vc
+    # Eq. 20/33:     Ē = γ ⊙ (B ⊙ K);  b*k = e_r (Eq. 8), γ⊙ = ē_r (Eq. 19/32)
+    Ebar = gamma * (b * k)
 
-        # Eq. 24/43:     Q_γ, row γ_r ⊙ q_r
-        Qg = gamma * qc
+    # Eq. 8, 20/33:  Z = W ⊙ V  (z_r = w_r ⊙ v_r)
+    Z = w * v
 
-        # --- WY triangular solve (the parallelization) ------------------------
-        # Eq. 21/34, entry Eq. 87:  T = tril(Ē K̄ᵀ, -1), T_rs = ē_rᵀ k̄_s (s<r)
-        T = jnp.tril(Ebar @ Kbar.T, k=-1)
+    # Eq. 24/43:     Q_γ, row γ_r ⊙ q_r
+    Qg = gamma * q
 
-        # Eq. 21/34:  A = (I + T)^{-1}  (unit lower-tri -> forward substitution)
-        A = jax.scipy.linalg.solve_triangular(
-            eye + T, eye, lower=True, unit_diagonal=True
-        )
+    # --- WY triangular solve (the parallelization) ---
+    # Eq. 21/34, entry Eq. 87:  T = tril(Ē K̄ᵀ, -1), T_rs = ē_rᵀ k̄_s (s<r)
+    T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)  # [N, C, C]
 
-        # --- WY auxiliaries + residual ----------------------------------------
-        # Eq. 22/34:  Y = A Ē  (erase-side auxiliary)
-        Y = A @ Ebar
+    # Eq. 21/34:  A = (I + T)^{-1}  (unit lower-tri -> forward substitution,
+    # batched over the N chunks)
+    A = jax.scipy.linalg.solve_triangular(
+        eye + T, jnp.broadcast_to(eye, T.shape), lower=True, unit_diagonal=True
+    )
 
-        # Eq. 22/34:  U = A Z  (write-side aux; SAME inverse A, two RHS — A.4)
-        U = A @ Z
+    # --- WY auxiliaries ---
+    # Eq. 22/34:  Y = A Ē  (erase-side auxiliary)
+    Y = A @ Ebar
+
+    # Eq. 22/34:  U = A Z  (write-side aux; SAME inverse A, two RHS — A.4)
+    U = A @ Z
+
+    # Eq. 25/43:  (A_qk)_rs = 1_{r≥s} q_rᵀ Diag(γ_r/γ_s) k_s  (tril incl. diag: s≤r)
+    Aqk = jnp.tril(Qg @ Kbar.swapaxes(-1, -2))  # [N, C, C]
+
+    # Eq. 23/41:  (K_tail)_r = (γ_C / γ_r) ⊙ k_r
+    Ktail = k * (gamma_C[:, None, :] / gamma)
+
+    # ---- Cross-chunk recurrence: the ONLY sequential part ---------------------
+    # (Sec. 2.1 / Eq. 3 structure.) S is the raw chunk-entry state S_[n] (== S_0,
+    # NOT decay-normalized); each step is three [C, d] x [d, d] matmuls.
+    def chunk_step(
+        S: jax.Array,
+        inp: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> tuple[jax.Array, jax.Array]:
+        Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n = inp
 
         # Eq. 35:     R = U − Y S_0  (stacked residual rows ρ_r, Eq. 37)
-        R = U - Y @ S
-
-        # --- Output block -----------------------------------------------------
-        # Eq. 25/43:  (A_qk)_rs = 1_{r≥s} q_rᵀ Diag(γ_r/γ_s) k_s  (tril incl. diag: s≤r)
-        Aqk = jnp.tril(Qg @ Kbar.T)
+        R = U_n - Y_n @ S
 
         # Eq. 24/44:  O = Q_γ S_0 + A_qk (U − Y S_0)
-        o = Qg @ S + Aqk @ R
-
-        # --- End-of-chunk state -----------------------------------------------
-        # Eq. 23/41:  (K_tail)_r = (γ_C / γ_r) ⊙ k_r
-        Ktail = kc * (gamma_C[None, :] / gamma)
+        o = Qg_n @ S + Aqk_n @ R
 
         # Eq. 23/40:  S_[n+1] = Diag(γ_C) S_0 + K_tailᵀ R
         # Diag(γ_C) S_0: broadcast over key-channel rows (decay lives on key axis)
-        S_new = gamma_C[:, None] * S + Ktail.T @ R
+        S_new = gamma_C_n[:, None] * S + Ktail_n.T @ R
 
         return S_new, o
 
-    # Cross-chunk recurrence: sequential scan over N = L/C chunks (Sec. 2.1 / Eq. 3 structure).
-    S_final, o = lax.scan(chunk_step, S0, (q, k, v, g, b, w))
+    S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C))
     return o.reshape(L, dv), S_final
 
 

@@ -221,9 +221,14 @@ class GatedDeltaNet2(nnx.Module):
         chunk_size: int = 64,  # C; App. C.2 fixes C = 64
         conv_size: int = 4,
         expanded_erase: bool = False,  # erase gate in [0,2] (neg-eigenvalue variant; Sec. 3.1, App. C.1)
+        compute_dtype: jnp.dtype = jnp.float32,
         *,
         rngs: nnx.Rngs,
     ):
+        # Matmul dtype for the q/k/v/b/w/o projection Linears (bf16 on H200). The
+        # chunkwise/recurrent core (core.py) upcasts to fp32 regardless, and the
+        # log-decay branch (f_proj) is kept fp32 below — both for numerical safety.
+        self.compute_dtype = compute_dtype
         self.d_model = d_model
         self.H = num_heads
         self.Hv = num_v_heads or num_heads
@@ -243,19 +248,49 @@ class GatedDeltaNet2(nnx.Module):
 
         # Linear projections feeding the SiLU/conv paths (Sec. 3.5; Fig. 1 'Linear' boxes).
         self.q_proj = nnx.Linear(
-            d_model, k_proj_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+            d_model,
+            k_proj_dim,
+            use_bias=False,
+            kernel_init=_XAVIER,
+            dtype=compute_dtype,
+            param_dtype=F32,
+            rngs=rngs,
         )
         self.k_proj = nnx.Linear(
-            d_model, k_proj_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+            d_model,
+            k_proj_dim,
+            use_bias=False,
+            kernel_init=_XAVIER,
+            dtype=compute_dtype,
+            param_dtype=F32,
+            rngs=rngs,
         )
         self.v_proj = nnx.Linear(
-            d_model, v_proj_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+            d_model,
+            v_proj_dim,
+            use_bias=False,
+            kernel_init=_XAVIER,
+            dtype=compute_dtype,
+            param_dtype=F32,
+            rngs=rngs,
         )
         self.b_proj = nnx.Linear(
-            d_model, k_proj_dim, use_bias=True, kernel_init=_XAVIER, rngs=rngs
+            d_model,
+            k_proj_dim,
+            use_bias=True,
+            kernel_init=_XAVIER,
+            dtype=compute_dtype,
+            param_dtype=F32,
+            rngs=rngs,
         )  # Proj_b, Eq. 85: b = σ(Proj_b x)
         self.w_proj = nnx.Linear(
-            d_model, v_proj_dim, use_bias=True, kernel_init=_XAVIER, rngs=rngs
+            d_model,
+            v_proj_dim,
+            use_bias=True,
+            kernel_init=_XAVIER,
+            dtype=compute_dtype,
+            param_dtype=F32,
+            rngs=rngs,
         )  # Proj_w, Eq. 85: w = σ(Proj_w x)
         self.f_proj = LowRankLinear(
             d_model, self.dk, k_proj_dim, use_bias=True, rngs=rngs
@@ -288,7 +323,13 @@ class GatedDeltaNet2(nnx.Module):
         )
 
         self.o_proj = nnx.Linear(
-            v_proj_dim, d_model, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+            v_proj_dim,
+            d_model,
+            use_bias=False,
+            kernel_init=_XAVIER,
+            dtype=compute_dtype,
+            param_dtype=F32,
+            rngs=rngs,
         )  # back to d_model
 
         # App. D.5: every Linear kernel above uses Xavier-uniform init, gain 2^{-2.5}
