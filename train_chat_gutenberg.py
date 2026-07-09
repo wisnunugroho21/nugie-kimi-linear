@@ -46,6 +46,7 @@ import optax
 from flax import nnx
 
 from kimi_linear_gdn2 import KimiLinear, KimiLinearConfig, count_params
+from optimizer import make_optimizer
 
 # Reuse the exact training step (AdamW + grad clip + MoE router-bias update) and the
 # cross-entropy from train.py, so this script only adds data + eval + chat on top.
@@ -212,7 +213,9 @@ def main(
     model = KimiLinear(cfg, rngs=nnx.Rngs(seed))
     print(f"model: {count_params(model):,} params | vocab {cfg.vocab_size}")
 
-    # --- Optax: clip -> AdamW under a warmup-cosine schedule ---
+    # --- Optax: clip -> Muon/AdamW (Moonlight recipe) under a warmup-cosine
+    # schedule; same LR scale as AdamW thanks to Muon's consistent-RMS scaling
+    # (see optimizer.py for the matrix/non-matrix split).
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=lr,
@@ -220,11 +223,7 @@ def main(
         decay_steps=steps,
         end_value=lr * 0.1,
     )
-    tx = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=schedule, weight_decay=0.01),
-    )
-    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    optimizer = make_optimizer(model, schedule, weight_decay=0.01)
 
     # --- training loop with per-step evaluation ---
     print("\ntraining (Ctrl-C to stop early and jump to chat)\n" + "-" * 64)

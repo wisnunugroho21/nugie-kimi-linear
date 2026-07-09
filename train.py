@@ -4,7 +4,8 @@ exercising the four requested libraries together:
 
     JAX        — array/compute backend and autodiff.
     Flax NNX   — the module system the model is written in (kimi_linear_gdn2.py).
-    Optax      — optimizer: AdamW + global-norm grad clipping + warmup-cosine LR.
+    Optax      — optimizer: Muon (matrices) / AdamW (the rest) via optimizer.py,
+                 with global-norm grad clipping + warmup-cosine LR.
     Orbax      — checkpoint save / restore (verified by a bit-exact reload).
 
 TASK — "continue the counting sequence." Each example is an arithmetic
@@ -39,6 +40,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from kimi_linear_gdn2 import KimiLinear, KimiLinearConfig, count_params
 from multi_latent_attention.moe import GroupedGemmMoE, update_router_bias
+from optimizer import make_optimizer
 
 
 # --------------------------------------------------------------------------- #
@@ -149,7 +151,9 @@ def main(
         f"| the rest are GDN-2 linear-attention layers"
     )
 
-    # --- Optax: clip -> AdamW, under a warmup-cosine learning-rate schedule. ---
+    # --- Optax: clip -> Muon/AdamW (Moonlight recipe), warmup-cosine LR schedule.
+    # Muon's consistent-RMS scaling makes this the same LR scale AdamW would use;
+    # see optimizer.py for the matrix/non-matrix parameter split.
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=lr,
@@ -157,13 +161,7 @@ def main(
         decay_steps=steps,
         end_value=lr * 0.1,
     )
-    tx = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=schedule, weight_decay=0.01),
-    )
-    # wrt=nnx.Param: only Param leaves get optimizer state (router_bias is a plain
-    # Variable updated by hand above, so it is correctly left out).
-    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    optimizer = make_optimizer(model, schedule, weight_decay=0.01)
 
     # --- Training loop (fresh random batch each step). ---
     held_out = sample_batch(jax.random.PRNGKey(10_000), 64, seq_len, vocab_size)

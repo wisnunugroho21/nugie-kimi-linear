@@ -57,7 +57,8 @@ verifies that streaming token-by-token reproduces the full-sequence forward exac
 | `gated_deltanet_2/layer.py` | GDN-2 **token mixer** (projections, short convs, L2-norm q/k, decoupled gates, gated RMSNorm output). |
 | `multi_latent_attention/attention.py` | **MLA** full-attention in the absorbed, NoPE, GQA form (shared KV latent acts as both K and V). |
 | `multi_latent_attention/moe.py` | Token-dispatched **grouped-GEMM MoE** with a shared expert, aux-loss-free load balancing + group-limited (node-limited) routing. |
-| `train.py` | **Training + checkpoint demo**: Optax (AdamW + clip + warmup-cosine) and Orbax (save/restore). |
+| `optimizer.py` | **Muon/AdamW split** (Moonlight recipe): Muon for hidden weight matrices (incl. batched MoE experts), AdamW for embed/head/biases/norms/decays. |
+| `train.py` | **Training + checkpoint demo**: Optax (Muon + clip + warmup-cosine) and Orbax (save/restore). |
 | `train_chat_gutenberg.py` | **Real-data training + chat**: Project Gutenberg via HuggingFace `datasets`/`transformers`, batched with `grain`; trains with per-step eval, then an interactive chat REPL. |
 | `sanity_check.py` | Correctness checks (parallel paths == reference paths). |
 
