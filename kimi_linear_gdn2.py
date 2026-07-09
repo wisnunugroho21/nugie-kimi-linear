@@ -336,9 +336,15 @@ class KimiLinear(nnx.Module):
         cost scales with P/chunk_size sequential steps, not P. Each decode step then
         feeds back ONE token and carries the caches forward — the GDN-2 layers via
         their fixed-size recurrent state, the MLA layers via the growing latent
-        cache. (Wrap `step` in nnx.jit for a fast decode loop.)"""
+        cache. The decode loop runs through `_decode_step`, a module-level nnx.jit
+        function: it compiles once per (batch size, cache length) and every further
+        token — across generate() calls too — reuses the trace."""
         B, P = prompt_ids.shape
-        max_len = max_len or (P + max_new_tokens)
+        # Default the cache length to the config's declared context cap when the
+        # request fits inside it: a FIXED cache shape lets _decode_step reuse its
+        # compiled trace across generate() calls with different prompt lengths
+        # (e.g. a chat loop) instead of recompiling for every P + max_new_tokens.
+        max_len = max_len or max(self.cfg.max_seq_len, P + max_new_tokens)
 
         caches = self.init_cache(B, max_len)
         logits, caches = self.step(prompt_ids, caches)  # prefill the prompt
@@ -346,11 +352,29 @@ class KimiLinear(nnx.Module):
         outs = [next_tok]
 
         for _ in range(max_new_tokens - 1):
-            logits, caches = self.step(next_tok, caches)  # decode one token
-            next_tok = jnp.argmax(logits[:, -1:], axis=-1)
+            next_tok, caches = _decode_step(self, next_tok, caches)
             outs.append(next_tok)
 
         return jnp.concatenate(outs, axis=1)  # [B, max_new_tokens]
+
+
+# --------------------------------------------------------------------------- #
+#  Jitted greedy decode step, shared by every generate() call.
+#
+#  During decoding everything is shape-constant — the weights, the fixed-size
+#  GDN-2 states, the preallocated MLA latent buffers (position is a TRACED int32,
+#  so advancing it never retraces), and L=1 — so this compiles ONCE per (batch
+#  size, cache length) and each further token replays the compiled trace.
+#  Module-level on purpose: nnx.jit keys its compilation cache on the function
+#  object, so a wrapper created inside generate() would recompile every call.
+# --------------------------------------------------------------------------- #
+@nnx.jit
+def _decode_step(
+    model: KimiLinear, tok: jax.Array, caches: list
+) -> tuple[jax.Array, list]:
+    """One greedy decode step: tok int[B, 1] -> (next greedy token int[B, 1], caches)."""
+    logits, caches = model.step(tok, caches)
+    return jnp.argmax(logits[:, -1:], axis=-1), caches
 
 
 def count_params(model: nnx.Module) -> int:
