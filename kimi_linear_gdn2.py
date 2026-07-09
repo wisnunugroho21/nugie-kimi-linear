@@ -320,10 +320,13 @@ class KimiLinear(nnx.Module):
         """Greedy autoregressive decode that REUSES each layer's state across steps.
         prompt_ids: int[B, P]. Returns the continuation int[B, max_new_tokens].
 
-        Prefill consumes the whole prompt in one step (filling every layer's cache);
-        each decode step then feeds back ONE token and carries the caches forward — the
-        GDN-2 layers via their fixed-size recurrent state, the MLA layers via the
-        growing latent cache. (Wrap `step` in nnx.jit for a fast decode loop.)"""
+        Prefill consumes the whole prompt in one step (filling every layer's cache) —
+        the GDN-2 layers push all whole chunks of the prompt through their PARALLEL
+        chunkwise core and only the ragged tail through the recurrence, so prefill
+        cost scales with P/chunk_size sequential steps, not P. Each decode step then
+        feeds back ONE token and carries the caches forward — the GDN-2 layers via
+        their fixed-size recurrent state, the MLA layers via the growing latent
+        cache. (Wrap `step` in nnx.jit for a fast decode loop.)"""
         B, P = prompt_ids.shape
         max_len = max_len or (P + max_new_tokens)
 

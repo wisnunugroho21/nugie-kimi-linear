@@ -454,9 +454,12 @@ class GatedDeltaNet2(nnx.Module):
         return self._output(o, x)
 
     # ----------------------------------------------------------------------- #
-    #  Streaming / inference.  Same math, but via the RECURRENT core, which works
-    #  for ANY length (no chunk-size divisibility constraint) and naturally threads
-    #  the fixed-size state in -> out.  One method serves both phases of decoding:
+    #  Streaming / inference.  Same math, threading the fixed-size state in -> out.
+    #  `step` picks the fastest core for the given length: the chunk-aligned prefix
+    #  of the input goes through the PARALLEL chunkwise core (fast prefill for long
+    #  prompts), the ragged tail — which includes the L=1 decode step — through the
+    #  RECURRENT core (no chunk-size divisibility constraint). One method serves
+    #  both phases of decoding:
     #     prefill: out, cache = layer.step(prompt, layer.init_cache(B, ...))
     #     decode : out, cache = layer.step(one_token, cache)   # repeat
     # ----------------------------------------------------------------------- #
@@ -477,7 +480,19 @@ class GatedDeltaNet2(nnx.Module):
         )
 
     def step(self, x: jax.Array, cache: GDN2Cache) -> tuple[jax.Array, GDN2Cache]:
-        """Streaming forward. x: [B, L, d_model] (L>=1). Returns (out, new_cache)."""
+        """Streaming forward. x: [B, L, d_model] (L>=1). Returns (out, new_cache).
+
+        The length is split as L = n_full + tail with n_full = (L // C)·C: the
+        chunk-aligned prefix runs through the parallel CHUNKWISE core, the tail
+        through the token-by-token RECURRENT core. Both compute the exact same
+        recurrence and thread the same fixed-size state, so the split point is
+        invisible in the output (verified in sanity_check.py). Decode steps
+        (L=1 < C) take the recurrent path only, as before.
+
+        The prefill win is in SEQUENTIAL DEPTH: L/C scan steps instead of L,
+        which is what dominates on accelerators. On CPU the recurrent scan is
+        already compute-bound and the chunkwise core's pairwise-ratio tensor
+        costs O(L·C·dk), so there the chunkwise path only wins for small C."""
         q, k, v, g, b, w, new_conv = self._project(
             x, conv_states=(cache.q_conv, cache.k_conv, cache.v_conv)
         )
@@ -487,9 +502,39 @@ class GatedDeltaNet2(nnx.Module):
         assert new_conv is not None
         qcs, kcs, vcs = new_conv
 
-        # Recurrent core: token-by-token, threading S_in -> S_out (Eq. 9 / 29).
-        o, new_state = recurrent_gated_delta_rule_2(
-            q, k, v, g, b, w, cache.recurrent_state
-        )
+        L = x.shape[1]
+        n_full = (L // self.chunk_size) * self.chunk_size  # chunk-aligned prefix
+        S = cache.recurrent_state
+        outs = []
 
-        return self._output(o, x), GDN2Cache(new_state, qcs, kcs, vcs)
+        if n_full > 0:
+            # Chunkwise prefill of the aligned prefix (Eq. 18-25), warm-started
+            # from — and updating — the running state S.
+            o_head, S = chunkwise_gated_delta_rule_2(
+                q[:, :, :n_full],
+                k[:, :, :n_full],
+                v[:, :, :n_full],
+                g[:, :, :n_full],
+                b[:, :, :n_full],
+                w[:, :, :n_full],
+                S,
+                chunk_size=self.chunk_size,
+            )
+            outs.append(o_head)
+
+        if n_full < L:
+            # Ragged tail (or the whole input when L < C, e.g. the decode step):
+            # recurrent core, token-by-token (Eq. 9 / 29).
+            o_tail, S = recurrent_gated_delta_rule_2(
+                q[:, :, n_full:],
+                k[:, :, n_full:],
+                v[:, :, n_full:],
+                g[:, :, n_full:],
+                b[:, :, n_full:],
+                w[:, :, n_full:],
+                S,
+            )
+            outs.append(o_tail)
+
+        o = outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=2)
+        return self._output(o, x), GDN2Cache(S, qcs, kcs, vcs)

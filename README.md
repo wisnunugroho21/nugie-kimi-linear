@@ -35,7 +35,7 @@ path, so the model can score a whole sequence at once or decode token-by-token w
 
 | | Full sequence — `model(ids)` | Streaming — `model.step` / `model.generate` |
 |---|---|---|
-| GDN-2 (linear) | chunkwise-parallel core | recurrent core, carrying a **fixed-size** state `S` + short-conv cache |
+| GDN-2 (linear) | chunkwise-parallel core | chunkwise **prefill** + recurrent decode, carrying a **fixed-size** state `S` + short-conv cache |
 | MLA (full attn) | full causal-attention matrix | cached KV **latent** (grows with context) |
 
 ```python
@@ -90,8 +90,7 @@ rough; press Ctrl-C during training to jump straight to chat (`/exit` to quit).
 * **Deliberate simplifications (flagged inline):** tiny default dims; the GDN-2
   layer stores the decay `a` per (head, channel) rather than per head; the decay bias
   δ starts at −4 (not the paper's value) so early decay is mild; group-limited MoE
-  routing omitted; streaming prefill uses the recurrent core (chunkwise prefill would
-  be faster for long prompts).
+  routing omitted.
 * **Numerical note:** the GDN-2 chunkwise core runs in fp32 and never forms the
   textbook `exp(-G)` (which overflows under strong decay). Instead it builds the
   causal pairwise decay ratios `exp(G_r − G_s)` for `s ≤ r` directly in log space —

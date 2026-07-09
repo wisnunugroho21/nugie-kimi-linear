@@ -16,6 +16,9 @@ trust that the code matches the math in the papers.
      fixed-size recurrent + conv state, MLA's latent cache) == the full-sequence
      forward. The predicted (argmax) tokens must match exactly, so generation is
      equivalent to scoring the whole sequence at once.
+  5. Chunkwise prefill: a single step() over a ragged-length prompt (whole chunks
+     via the parallel chunkwise core + a recurrent tail) == the full forward on
+     those positions, and decode continues seamlessly from the prefilled caches.
 """
 
 import sys
@@ -148,6 +151,19 @@ def check_streaming_equals_full():
     print(f"[4] streaming vs full forward     | max|Δlogits| {diff:.2e} "
           f"argmax-agreement {agree:.3f} | generate -> {tuple(gen.shape)}")
     assert diff < 1e-3 and agree == 1.0 and gen.shape == (B, 10)
+
+    # Chunkwise prefill: one step() call with a RAGGED prompt length (13 = one
+    # 8-chunk through the parallel core + a 5-token recurrent tail) must equal the
+    # full forward on those positions, and decoding must continue seamlessly from
+    # the prefilled caches — i.e. the chunkwise/recurrent split is invisible.
+    P = 13
+    pre_logits, pre_caches = model.step(ids[:, :P], model.init_cache(B, max_len=L))
+    pdiff = float(jnp.max(jnp.abs(full_logits[:, :P] - pre_logits)))
+    nxt_logits, _ = model.step(ids[:, P : P + 1], pre_caches)
+    ndiff = float(jnp.max(jnp.abs(full_logits[:, P] - nxt_logits[:, 0])))
+    print(f"[5] chunkwise prefill (ragged 13) | max|Δlogits| prefill {pdiff:.2e} "
+          f"next-token {ndiff:.2e}")
+    assert pdiff < 1e-3 and ndiff < 1e-3
 
 
 if __name__ == "__main__":
