@@ -12,15 +12,11 @@ progression mod V:  s[t] = (start + t) mod V, with a random `start` per row. The
 model is trained with the standard causal next-token objective and learns the
 successor rule, then GENERALIZES to held-out starts (held-out accuracy -> 1.0).
 
-Why this task (and not associative recall / copy)? Two honest reasons:
-  • It generalizes cleanly and fast on a CPU, so the demo is reproducible.
-  • It keeps the GDN-2 decay MILD. The chunkwise core (gated_deltanet_2/core.py)
-    forms exp(-G) with G the cumulative log-decay; in fp32 a very strong decay over
-    a chunk can overflow (exp(-G)=inf while exp(G)=0 -> 0*inf = NaN). Tasks that
-    force sharp decay (e.g. long copy/induction) can hit this during the high-LR
-    "phase transition", so we keep chunk_size small and the LR moderate here.
-The model's recall machinery itself is validated separately by the GDN-2
-chunkwise==recurrent equivalence test and the MoE dispatch==dense test.
+Why this task (and not associative recall / copy)? It generalizes cleanly and fast
+on a CPU, so the demo is reproducible in seconds. The model's recall machinery
+itself is validated separately by the GDN-2 chunkwise==recurrent equivalence test
+(including a strong-decay stress test — the chunkwise core is overflow-proof at
+any decay strength, see gated_deltanet_2/core.py) and the MoE dispatch==dense test.
 
 Run:  python train.py
 """
@@ -124,7 +120,8 @@ def main(
     bias_lr: float = 1e-3,
     seed: int = 0,
 ):
-    # Small config; chunk_size=8 keeps the fp32 decay accumulation safe (see docstring).
+    # Small config; chunk_size=8 just needs to divide seq_len (32) — the chunkwise
+    # core is numerically safe at any chunk size / decay strength (see core.py).
     # Full attention (MLA) every 4th layer -> 3:1 linear:full, Kimi Linear's recipe.
     cfg = KimiLinearConfig(
         vocab_size=vocab_size,

@@ -57,6 +57,41 @@ def check_gdn2_chunkwise_equals_recurrent():
     assert rel < 1e-4
 
 
+def check_gdn2_strong_decay_stability():
+    """Extreme decay stress test. The chunkwise core forms pairwise decay ratios
+    exp(G_r - G_s) in log space (every exponent <= 0), so even a cumulative
+    log-decay of ~ -20 * 64 within one chunk — which overflowed the old
+    exp(-G)-based form into inf/NaN — must stay finite, match the recurrent
+    reference, AND have finite gradients (the 'trains fine, then NaN' case)."""
+    B, H, L, dk, dv, C = 2, 2, 128, 16, 16, 64
+    ks = jax.random.split(jax.random.PRNGKey(3), 7)
+    q = jax.random.normal(ks[0], (B, H, L, dk))
+    k = jax.random.normal(ks[1], (B, H, L, dk))
+    v = jax.random.normal(ks[2], (B, H, L, dv))
+    g = jnp.minimum(-20.0 + jax.random.normal(ks[3], (B, H, L, dk)), 0.0)  # brutal decay
+    b = jax.nn.sigmoid(jax.random.normal(ks[4], (B, H, L, dk)))
+    w = jax.nn.sigmoid(jax.random.normal(ks[5], (B, H, L, dv)))
+    S0 = jax.random.normal(ks[6], (B, H, dk, dv)) * 0.1
+
+    o_c, s_c = chunkwise_gated_delta_rule_2(q, k, v, g, b, w, S0, chunk_size=C)
+    o_r, s_r = recurrent_gated_delta_rule_2(q, k, v, g, b, w, S0)
+    finite = bool(jnp.all(jnp.isfinite(o_c)) and jnp.all(jnp.isfinite(s_c)))
+    rel = jnp.max(jnp.abs(o_c - o_r)) / (jnp.max(jnp.abs(o_r)) + 1e-9)
+
+    # Gradient path: a NaN anywhere in the forward poisons every gradient.
+    def loss(q, k, v, g, b, w, S0):
+        o, s = chunkwise_gated_delta_rule_2(q, k, v, g, b, w, S0, chunk_size=C)
+        return jnp.sum(o**2) + jnp.sum(s**2)
+
+    grads = jax.grad(loss, argnums=(0, 1, 2, 3, 4, 5, 6))(q, k, v, g, b, w, S0)
+    grads_finite = bool(
+        all(jnp.all(jnp.isfinite(gr)) for gr in grads)
+    )
+    print(f"[1b] GDN-2 strong-decay stress    | finite={finite} rel err {float(rel):.2e} "
+          f"grads finite={grads_finite}")
+    assert finite and grads_finite and rel < 1e-4
+
+
 def check_moe_dispatch_equals_dense():
     B, L, d = 2, 64, 128
     x = jax.random.normal(jax.random.PRNGKey(1), (B, L, d))
@@ -117,6 +152,7 @@ def check_streaming_equals_full():
 
 if __name__ == "__main__":
     check_gdn2_chunkwise_equals_recurrent()
+    check_gdn2_strong_decay_stability()
     check_moe_dispatch_equals_dense()
     check_model_forward()
     check_streaming_equals_full()

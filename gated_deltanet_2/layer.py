@@ -28,7 +28,8 @@ Two honest deviations from the paper, flagged inline below:
       d_k columns to recover the paper).
   (2) All Linear kernels use the paper's Xavier-uniform init, gain 2^{-2.5}, with zero
       biases (App. D.5). The one exception: the decay bias δ starts negative (−4), not
-      the paper's value, to keep early decay mild for fp32 stability (App. D.1).
+      the paper's value, so early decay is mild — a training-dynamics choice; the
+      chunkwise core itself is overflow-proof at any decay strength (see core.py).
 """
 
 from typing import NamedTuple
@@ -46,7 +47,7 @@ F32 = jnp.float32
 
 # App. D.5: Xavier-uniform init with gain 2^{-2.5} (variance_scaling scale = gain² =
 # 2^{-5}), replacing Flax NNX's default Linear kernel init. Biases stay at zero (the
-# NNX default) — except the decay bias δ, set negative in __init__ for fp32 safety.
+# NNX default) — except the decay bias δ, set negative in __init__ for mild early decay.
 _XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
 
 
@@ -309,8 +310,9 @@ class GatedDeltaNet2(nnx.Module):
         )  # 'a' in -exp(a)·softplus(·)
 
         # App. C.1: bias δ is stored per key channel -> shape [H·d_k]. Eq. 86 adds it pre-softplus.
-        #   Init negative (not the paper's value) so per-token decay starts mild (α≈1),
-        #   keeping cumulative decay / γ^{-1} in a safe fp32 range (cf. App. D.1).
+        #   Init negative (not the paper's value) so per-token decay starts mild (α≈1) —
+        #   a gentler starting point for training. (Purely a dynamics choice: the
+        #   chunkwise core is overflow-proof at any decay strength, see core.py.)
         self.dt_bias = nnx.Param(jnp.full((self.H * self.dk,), -4.0))  # δ
 
         # Output gate + gated RMSNorm + output projection (Sec. 3.5 / App. D.5).
@@ -333,7 +335,7 @@ class GatedDeltaNet2(nnx.Module):
         )  # back to d_model
 
         # App. D.5: every Linear kernel above uses Xavier-uniform init, gain 2^{-2.5}
-        # (_XAVIER); biases are zero except the decay bias δ (-4, for fp32 safety).
+        # (_XAVIER); biases are zero except the decay bias δ (-4, mild early decay).
 
     def _split_k(self, x: jax.Array, B: int, L: int) -> jax.Array:
         # Head reshaping for key-side tensors (App. C.1: "followed by head reshaping").

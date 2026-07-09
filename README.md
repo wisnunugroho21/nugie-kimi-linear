@@ -89,10 +89,12 @@ rough; press Ctrl-C during training to jump straight to chat (`/exit` to quit).
   (App. D.5).
 * **Deliberate simplifications (flagged inline):** tiny default dims; the GDN-2
   layer stores the decay `a` per (head, channel) rather than per head; the decay bias
-  δ starts at −4 (not the paper's value) for fp32 safety; group-limited MoE routing
-  omitted; streaming prefill uses the recurrent core (chunkwise prefill would be faster
-  for long prompts).
-* **Numerical caveat:** the GDN-2 chunkwise core runs in fp32 and forms `exp(-G)`
-  with `G` the cumulative log-decay. Very strong decay within a chunk can overflow
-  (`exp(-G)=inf`, `exp(G)=0` → `0*inf=NaN`). Keep `gdn_chunk_size` modest and the
-  learning rate moderate, as `train.py` does.
+  δ starts at −4 (not the paper's value) so early decay is mild; group-limited MoE
+  routing omitted; streaming prefill uses the recurrent core (chunkwise prefill would
+  be faster for long prompts).
+* **Numerical note:** the GDN-2 chunkwise core runs in fp32 and never forms the
+  textbook `exp(-G)` (which overflows under strong decay). Instead it builds the
+  causal pairwise decay ratios `exp(G_r − G_s)` for `s ≤ r` directly in log space —
+  every exponent is ≤ 0, so the core is overflow-proof at **any** decay strength
+  (strong decay just underflows to 0, the correct "fully erased" limit). This is
+  verified by a strong-decay stress test in `sanity_check.py`, including gradients.

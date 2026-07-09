@@ -15,15 +15,26 @@ Per-head recurrence (Eq. 10 / 29):
 Chunkwise WY form (Eqs. 18-25 / 30-44):
     G_r   = cumsum(g)             (inclusive, within chunk)        Eq. 18/30
     gamma = exp(G),  gamma_C = gamma[-1]                           Eq. 18/30
-    Kbar  = gamma^{-1} ⊙ K        (decay-normalized keys)          Eq. 19/32/33
-    Ebar  = gamma     ⊙ (B ⊙ K)   (decay-absorbed erase factor)    Eq. 20/33
+    D_rsc = exp(G_rc - G_sc)·1[s≤r]  (pairwise decay ratios)       Eq. 19/32, stable form
+    Ebar  = gamma ⊙ (B ⊙ K)       (decay-absorbed erase factor)    Eq. 20/33
     Z     = W ⊙ V                                                  Eq. 20/33
-    T     = tril(Ebar Kbar^T, -1)                                  Eq. 21/34
+    T_rs  = Σ_c (B⊙K)_rc K_sc D_rsc,  s < r                        Eq. 21/34
     A     = (I + T)^{-1}          (unit lower-triangular solve)    Eq. 21/34
     Y, U  = A Ebar, A Z           (WY auxiliaries; share inverse)  Eq. 22/34
     R     = U - Y S0                                               Eq. 35
+    Aqk_rs= Σ_c Q_rc K_sc D_rsc,  s ≤ r                            Eq. 25/43
     O     = Qgamma S0 + Aqk R                                      Eq. 24/44
+    Ktail = exp(G_C - G) ⊙ K                                       Eq. 23/41
     S_C   = diag(gamma_C) S0 + Ktail^T R                           Eq. 23/40
+
+NUMERICAL NOTE — why D instead of the textbook K̄ = γ^{-1}⊙K = exp(-G)⊙K:
+exp(-G) grows without bound under strong decay and overflows fp32 once -G
+exceeds ~88 anywhere in a chunk (the classic "trains fine, then NaN" failure).
+But K̄ only ever appears contracted against a γ-weighted row with s ≤ r, i.e.
+inside products exp(G_r - G_s) with G_r ≤ G_s (G is non-increasing). Forming
+those pairwise ratios directly in log space keeps EVERY exponent ≤ 0, so exp(·)
+∈ [0, 1] and nothing can overflow at any decay strength; strong decay merely
+underflows to 0, which is the mathematically correct "fully erased" limit.
 
 The gate-aware backward (Eqs. 64-82, Appendix B) is intentionally NOT written:
 jax.grad differentiates straight through solve_triangular and the elementwise
@@ -37,17 +48,6 @@ from jax import lax
 
 # math runs in fp32 (paper App. D.1/D.3/D.4)
 D_TYPE = jnp.float32
-
-# Numerical guard for the decay-normalized keys K̄ = γ^{-1}⊙K = exp(-G)⊙K (Eq.19/32).
-# g_t ≤ 0, so the within-chunk cumsum G is negative and exp(-G) grows; once the
-# trained decay is strong enough that -G exceeds ~88 anywhere in a chunk, exp(-G)
-# OVERFLOWS fp32 -> inf -> NaN (the classic "trains fine, then NaN" failure). We
-# floor G so exp(-G) ≤ exp(30) ≈ 1e13, far below the fp32 ceiling. A position past
-# this floor has decay weight exp(-30) ≈ 1e-13 — already fully erased — so flooring
-# is the correct limit, not an approximation that changes well-conditioned results.
-# Applied ONCE to G, so γ=exp(G), γ^{-1}=exp(-G), γ_C/γ, and Q_γ stay mutually
-# consistent (every telescoping ratio still uses the same clamped G).
-_LOG_DECAY_FLOOR = -30.0
 
 
 # --------------------------------------------------------------------------- #
@@ -95,19 +95,23 @@ def _chunkwise_single(
     # Eq. 18/30:  G_r = Σ_{i≤r} g_i (inclusive, within chunk)
     G = jnp.cumsum(g, axis=1)
 
-    # Numerical guard (see _LOG_DECAY_FLOOR): floor G so exp(-G) in K̄ below
-    # cannot overflow fp32. Order-preserving, applied before every use of G.
-    G = jnp.maximum(G, _LOG_DECAY_FLOOR)
-
-    # Eq. 18/30:  γ_r = exp(G_r)
+    # Eq. 18/30:  γ_r = exp(G_r).  g ≤ 0 ⇒ G ≤ 0 ⇒ γ ∈ (0, 1] — cannot overflow.
     gamma = jnp.exp(G)
 
     # γ_C, total chunk decay (last row of each chunk); Eq. 40/41
     gamma_C = gamma[:, -1]  # [N, dk]
 
-    # --- Decay normalization (removes Diag(α) from the recurrence) ---
-    # Eq. 19/32/33:  K̄ = γ^{-1} ⊙ K  (exp(-G) = 1/γ in log-space)
-    Kbar = k * jnp.exp(-G)
+    # --- Pairwise decay ratios (the stable form of Eq. 19/32; see module docstring) ---
+    # D[n, r, s, c] = exp(G_rc - G_sc) for s ≤ r, else 0. Within the mask G_r ≤ G_s
+    # (G is non-increasing), so every exponent is ≤ 0 and exp(·) ∈ [0, 1]: no decay
+    # strength can overflow. The masked-out s > r entries would have POSITIVE
+    # exponents — that is exactly the textbook exp(-G) overflow — so the mask is
+    # applied BEFORE the exp (exp(-inf) = 0).
+    # Memory: D is [N, C, C, dk] — the price of stability in pure JAX (a fused
+    # Triton/Pallas kernel would form these ratios tile-by-tile); chunk_size bounds it.
+    causal = jnp.tril(jnp.ones((C, C), dtype=bool))
+    logD = G[:, :, None, :] - G[:, None, :, :]  # [N, C, C, dk]
+    D = jnp.exp(jnp.where(causal[None, :, :, None], logD, -jnp.inf))
 
     # Eq. 20/33:     Ē = γ ⊙ (B ⊙ K);  b*k = e_r (Eq. 8), γ⊙ = ē_r (Eq. 19/32)
     Ebar = gamma * (b * k)
@@ -119,8 +123,10 @@ def _chunkwise_single(
     Qg = gamma * q
 
     # --- WY triangular solve (the parallelization) ---
-    # Eq. 21/34, entry Eq. 87:  T = tril(Ē K̄ᵀ, -1), T_rs = ē_rᵀ k̄_s (s<r)
-    T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)  # [N, C, C]
+    # Eq. 21/34, entry Eq. 87:  T_rs = ē_rᵀ k̄_s = Σ_c (b⊙k)_rc k_sc exp(G_rc − G_sc),
+    # s < r — the pairwise-ratio form of tril(Ē K̄ᵀ, -1). D already masks s > r;
+    # tril(-1) drops the diagonal (where D is exp(0) = 1).
+    T = jnp.tril(jnp.einsum("nrc,nsc,nrsc->nrs", b * k, k, D), k=-1)  # [N, C, C]
 
     # Eq. 21/34:  A = (I + T)^{-1}  (unit lower-tri -> forward substitution,
     # batched over the N chunks)
@@ -135,11 +141,15 @@ def _chunkwise_single(
     # Eq. 22/34:  U = A Z  (write-side aux; SAME inverse A, two RHS — A.4)
     U = A @ Z
 
-    # Eq. 25/43:  (A_qk)_rs = 1_{r≥s} q_rᵀ Diag(γ_r/γ_s) k_s  (tril incl. diag: s≤r)
-    Aqk = jnp.tril(Qg @ Kbar.swapaxes(-1, -2))  # [N, C, C]
+    # Eq. 25/43:  (A_qk)_rs = 1_{r≥s} q_rᵀ Diag(γ_r/γ_s) k_s = Σ_c q_rc k_sc D_rsc.
+    # Same pairwise-ratio form; D already applies the causal mask INCLUDING the
+    # diagonal (D_rr = exp(0) = 1), so no tril is needed.
+    Aqk = jnp.einsum("nrc,nsc,nrsc->nrs", q, k, D)  # [N, C, C]
 
-    # Eq. 23/41:  (K_tail)_r = (γ_C / γ_r) ⊙ k_r
-    Ktail = k * (gamma_C[:, None, :] / gamma)
+    # Eq. 23/41:  (K_tail)_r = (γ_C / γ_r) ⊙ k_r = exp(G_C − G_r) ⊙ k_r — again a
+    # log-space difference (exponent ≤ 0), NOT a ratio of two exps: under strong
+    # decay γ_C and γ_r can both underflow to 0, and 0/0 = NaN.
+    Ktail = k * jnp.exp(G[:, -1][:, None, :] - G)
 
     # ---- Cross-chunk recurrence: the ONLY sequential part ---------------------
     # (Sec. 2.1 / Eq. 3 structure.) S is the raw chunk-entry state S_[n] (== S_0,
