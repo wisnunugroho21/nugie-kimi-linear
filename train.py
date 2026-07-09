@@ -139,6 +139,8 @@ def main(
         moe_d_ff=128,
         moe_n_routed=6,
         moe_top_k=2,
+        moe_n_groups=3,  # group-limited routing: 6 experts in 3 groups of 2,
+        moe_topk_groups=2,  # each token draws its top-2 from its 2 best groups
     )
     model = KimiLinear(cfg, rngs=nnx.Rngs(seed))
     print(

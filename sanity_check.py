@@ -9,7 +9,8 @@ trust that the code matches the math in the papers.
      of arXiv:2605.22791). They are two ways to compute the same thing, so they must
      agree up to fp32 rounding.
   2. MoE: the token-dispatched grouped-GEMM == the dense "run every expert" reference
-     (same weights), so any difference is a dispatch/GEMM bug.
+     (same weights), so any difference is a dispatch/GEMM bug. Also asserts the
+     group-limited routing property (each token's experts span <= topk_groups groups).
   3. Model: a forward pass produces the right logits shape and finite values, and the
      3:1 GDN-2:MLA hybrid schedule is placed as expected.
   4. Streaming: decoding token-by-token while REUSING each layer's state (GDN-2's
@@ -98,12 +99,24 @@ def check_gdn2_strong_decay_stability():
 def check_moe_dispatch_equals_dense():
     B, L, d = 2, 64, 128
     x = jax.random.normal(jax.random.PRNGKey(1), (B, L, d))
-    moe = GroupedGemmMoE(d_model=d, d_ff=128, n_routed=8, top_k=2, rngs=nnx.Rngs(0))
+    moe = GroupedGemmMoE(d_model=d, d_ff=128, n_routed=8, top_k=2,
+                         n_groups=4, topk_groups=2, rngs=nnx.Rngs(0))
     y_dispatch, _aux = moe(x)  # MoE now always returns (out, aux)
     y_dense = moe.dense_forward(x)
     diff = jnp.max(jnp.abs(y_dispatch - y_dense))
-    print(f"[2] MoE dispatch vs dense         | max diff {float(diff):.2e}")
-    assert diff < 1e-4
+
+    # Group-limited routing property: every token's selected experts must come
+    # from at most topk_groups distinct expert groups (expert e is in group
+    # e // (E/n_groups)).
+    top_idx, _, _ = moe._route(x.reshape(B * L, d))
+    groups = top_idx // (moe.E // moe.n_groups)  # [T, k] group of each pick
+    used = jnp.zeros((B * L, moe.n_groups)).at[
+        jnp.arange(B * L)[:, None], groups
+    ].set(1.0)
+    max_groups_used = int(jnp.max(used.sum(-1)))
+    print(f"[2] MoE dispatch vs dense         | max diff {float(diff):.2e} | "
+          f"groups used/token <= {max_groups_used} (limit {moe.topk_groups})")
+    assert diff < 1e-4 and max_groups_used <= moe.topk_groups
 
 
 def check_model_forward():
@@ -111,7 +124,7 @@ def check_model_forward():
         vocab_size=64, d_model=128, n_layers=8, full_attn_period=4,
         gdn_num_heads=2, gdn_head_k_dim=32, gdn_head_v_dim=32, gdn_chunk_size=32,
         mla_num_q_heads=4, mla_num_kv_heads=2, mla_head_dim=32, max_seq_len=64,
-        moe_n_routed=6, moe_top_k=2, moe_d_ff=128,
+        moe_n_routed=6, moe_top_k=2, moe_d_ff=128, moe_n_groups=3, moe_topk_groups=2,
     )
     model = KimiLinear(cfg, rngs=nnx.Rngs(0))
     ids = jax.random.randint(jax.random.PRNGKey(2), (2, 64), 0, cfg.vocab_size)
@@ -129,7 +142,7 @@ def check_streaming_equals_full():
         vocab_size=64, d_model=128, n_layers=8, full_attn_period=4,
         gdn_num_heads=2, gdn_head_k_dim=32, gdn_head_v_dim=32, gdn_chunk_size=8,
         mla_num_q_heads=4, mla_num_kv_heads=2, mla_head_dim=32, max_seq_len=64,
-        moe_n_routed=6, moe_top_k=2, moe_d_ff=128,
+        moe_n_routed=6, moe_top_k=2, moe_d_ff=128, moe_n_groups=3, moe_topk_groups=2,
     )
     model = KimiLinear(cfg, rngs=nnx.Rngs(0))
     B, L = 2, 32

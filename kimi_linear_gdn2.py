@@ -106,6 +106,14 @@ class KimiLinearConfig:
     moe_n_routed: int = 8  # number of routed experts E (paper: 256)
     moe_n_shared: int = 1  # always-on shared experts
     moe_top_k: int = 2  # experts activated per token (paper: 8)
+    # Group-limited routing (DeepSeek-V3 / Kimi K2 "node-limited"): experts split
+    # into moe_n_groups groups; each token draws its top-k only from its
+    # moe_topk_groups best groups (at scale: bounds all-to-all traffic). 8 experts
+    # in 4 groups, top-2 groups mirrors V3's half-the-groups ratio. Constraints:
+    # moe_n_routed % moe_n_groups == 0 and moe_top_k <= moe_topk_groups * group size.
+    # Set moe_n_groups = 1 to disable.
+    moe_n_groups: int = 4
+    moe_topk_groups: int = 2
 
     rms_eps: float = 1e-5
 
@@ -173,6 +181,8 @@ class DecoderLayer(nnx.Module):
             n_routed=cfg.moe_n_routed,
             n_shared=cfg.moe_n_shared,
             top_k=cfg.moe_top_k,
+            n_groups=cfg.moe_n_groups,
+            topk_groups=cfg.moe_topk_groups,
             compute_dtype=cfg.cdtype,
             rngs=rngs,
         )

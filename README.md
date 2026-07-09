@@ -56,7 +56,7 @@ verifies that streaming token-by-token reproduces the full-sequence forward exac
 | `gated_deltanet_2/core.py` | GDN-2 **chunkwise-parallel** core + a token-by-token **recurrent reference**, each line mapped to the paper's equations. |
 | `gated_deltanet_2/layer.py` | GDN-2 **token mixer** (projections, short convs, L2-norm q/k, decoupled gates, gated RMSNorm output). |
 | `multi_latent_attention/attention.py` | **MLA** full-attention in the absorbed, NoPE, GQA form (shared KV latent acts as both K and V). |
-| `multi_latent_attention/moe.py` | Token-dispatched **grouped-GEMM MoE** with a shared expert + aux-loss-free load balancing. |
+| `multi_latent_attention/moe.py` | Token-dispatched **grouped-GEMM MoE** with a shared expert, aux-loss-free load balancing + group-limited (node-limited) routing. |
 | `train.py` | **Training + checkpoint demo**: Optax (AdamW + clip + warmup-cosine) and Orbax (save/restore). |
 | `train_chat_gutenberg.py` | **Real-data training + chat**: Project Gutenberg via HuggingFace `datasets`/`transformers`, batched with `grain`; trains with per-step eval, then an interactive chat REPL. |
 | `sanity_check.py` | Correctness checks (parallel paths == reference paths). |
@@ -89,8 +89,7 @@ rough; press Ctrl-C during training to jump straight to chat (`/exit` to quit).
   (App. D.5).
 * **Deliberate simplifications (flagged inline):** tiny default dims; the GDN-2
   layer stores the decay `a` per (head, channel) rather than per head; the decay bias
-  δ starts at −4 (not the paper's value) so early decay is mild; group-limited MoE
-  routing omitted.
+  δ starts at −4 (not the paper's value) so early decay is mild.
 * **Numerical note:** the GDN-2 chunkwise core runs in fp32 and never forms the
   textbook `exp(-G)` (which overflows under strong decay). Instead it builds the
   causal pairwise decay ratios `exp(G_r − G_s)` for `s ≤ r` directly in log space —
